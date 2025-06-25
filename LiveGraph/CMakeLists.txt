@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 project(LiveGraph VERSION 0.0.1 LANGUAGES CXX)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 
 find_package(Threads REQUIRED)
@@ -42,6 +42,11 @@ set_property(TARGET corelib PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 add_library(livegraph SHARED bind/livegraph.cpp src/graph.cpp src/transaction.cpp)
 target_link_libraries(livegraph corelib)
+target_include_directories(livegraph PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/bind>
+    $<INSTALL_INTERFACE:include>
+)
+
 install(TARGETS livegraph DESTINATION lib)
 install(FILES bind/livegraph.hpp DESTINATION include)
 
@@ -66,3 +71,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME AND BUILD_TESTING)
     include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
     doctest_discover_tests(tests)
 endif()
+
+
+# Build examples in the examples directory
+add_subdirectory(examples)
