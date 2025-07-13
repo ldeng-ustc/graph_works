@@ -25,6 +25,9 @@ endif
 # LD= /home/ldeng/open-source/OpenCilk_v1.0/OpenCilk-10.0.1-Linux/bin/clang++ -std=c++17
 
 
+# Only check for OpenCilk if not cleaning
+ifneq ($(filter clean,$(MAKECMDGOALS)),clean)
+
 ifndef CILK_HOME
     OPENCILK_DIR := $(CURDIR)/opencilk/OpenCilk-10.0.1-Linux
     OPENCILK_CLANGXX := $(OPENCILK_DIR)/bin/clang++
@@ -41,8 +44,14 @@ ifndef CILK_HOME
         # The result of the shell command is assigned to CILK_HOME.
         CILK_HOME := $(shell \
             mkdir -p opencilk && \
-            echo "Downloading OpenCilk..." && \
-            wget -O opencilk/opencilk.tar.gz https://github.com/OpenCilk/opencilk-project/releases/download/opencilk%2Fv1.0/OpenCilk-1.0-LLVM-10.0.1-Ubuntu-20.04-x86_64.tar.gz && \
+            TAR_FILE="opencilk/opencilk.tar.gz" && \
+            EXPECTED_MD5="959ca8c530c3f739f0f2806f066b8456" && \
+            if [ -f "$$TAR_FILE" ] && echo "$$EXPECTED_MD5  $$TAR_FILE" | md5sum -c --status >/dev/null 2>&1; then \
+                echo "opencilk.tar.gz already exists and MD5 is correct."; \
+            else \
+                echo "Downloading OpenCilk..." && \
+                wget -O $$TAR_FILE https://github.com/OpenCilk/opencilk-project/releases/download/opencilk%2Fv1.0/OpenCilk-1.0-LLVM-10.0.1-Ubuntu-20.04-x86_64.tar.gz; \
+            fi && \
             echo "Extracting OpenCilk..." && \
             tar -xzf opencilk/opencilk.tar.gz -C opencilk && \
             if [ -f "$(OPENCILK_CLANGXX)" ] && [ -f "$(OPENCILK_CLANG)" ]; then \
@@ -65,6 +74,8 @@ endif
 CXX = $(CILK_HOME)/bin/clang++ -std=c++17
 CC = $(CILK_HOME)/bin/clang -std=gnu11
 LD = $(CILK_HOME)/bin/clang++ -std=c++17
+
+endif # ifneq ($(filter clean,$(MAKECMDGOALS)),clean)
 
 # 严重的，涉及多个文件的头文件名不一致，无法使用
 # CXX = /home/ldeng/open-source/OpenCilk/build/bin/clang++ -std=c++17
