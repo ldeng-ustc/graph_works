@@ -47,15 +47,15 @@ ifndef CILK_HOME
             TAR_FILE="opencilk/opencilk.tar.gz" && \
             EXPECTED_MD5="959ca8c530c3f739f0f2806f066b8456" && \
             if [ -f "$$TAR_FILE" ] && echo "$$EXPECTED_MD5  $$TAR_FILE" | md5sum -c --status >/dev/null 2>&1; then \
-                echo "opencilk.tar.gz already exists and MD5 is correct."; \
+                echo "opencilk.tar.gz already exists and MD5 is correct." >&2; \
             else \
-                echo "Downloading OpenCilk..." && \
+                echo "Downloading OpenCilk..." >&2 && \
                 wget -O $$TAR_FILE https://github.com/OpenCilk/opencilk-project/releases/download/opencilk%2Fv1.0/OpenCilk-1.0-LLVM-10.0.1-Ubuntu-20.04-x86_64.tar.gz; \
             fi && \
-            echo "Extracting OpenCilk..." && \
+            echo "Extracting OpenCilk..." >&2 && \
             tar -xzf opencilk/opencilk.tar.gz -C opencilk && \
             if [ -f "$(OPENCILK_CLANGXX)" ] && [ -f "$(OPENCILK_CLANG)" ]; then \
-                echo "OpenCilk setup successful. Using $(OPENCILK_DIR)"; \
+                echo "OpenCilk setup successful. Using $(OPENCILK_DIR)" >&2; \
                 echo "$(OPENCILK_DIR)"; \
             else \
                 echo "Error: OpenCilk setup failed. clang++ or clang not found after extraction." >&2; \
