@@ -24,11 +24,42 @@ endif
 # CC = /home/ldeng/open-source/OpenCilk_v1.0/OpenCilk-10.0.1-Linux/bin/clang -std=gnu11
 # LD= /home/ldeng/open-source/OpenCilk_v1.0/OpenCilk-10.0.1-Linux/bin/clang++ -std=c++17
 
+
 ifndef CILK_HOME
-$(warning CILK_HOME is not defined, using current directory.)
-$(info To set CILK_HOME, run: make CILK_HOME=/path/to/OpenCilk)
-$(info Make sure $(CILK_HOME)/bin/clang++ is valid, and OpenCilk has correct version (v1.0).)
-CILK_HOME=./
+    OPENCILK_DIR := $(CURDIR)/opencilk/OpenCilk-10.0.1-Linux
+    OPENCILK_CLANGXX := $(OPENCILK_DIR)/bin/clang++
+    OPENCILK_CLANG := $(OPENCILK_DIR)/bin/clang
+
+    # Check if local OpenCilk is already available
+    ifneq ("$(wildcard $(OPENCILK_CLANGXX))","")
+        $(info CILK_HOME not set. Using local OpenCilk at $(OPENCILK_DIR))
+        CILK_HOME := $(OPENCILK_DIR)
+    else
+        $(info CILK_HOME not set. Local OpenCilk not found. Will attempt to download.)
+        # This block will execute if OpenCilk is not found.
+        # It uses a shell command to perform the setup.
+        # The result of the shell command is assigned to CILK_HOME.
+        CILK_HOME := $(shell \
+            mkdir -p opencilk && \
+            echo "Downloading OpenCilk..." && \
+            wget -O opencilk/opencilk.tar.gz https://github.com/OpenCilk/opencilk-project/releases/download/opencilk%2Fv1.0/OpenCilk-1.0-LLVM-10.0.1-Ubuntu-20.04-x86_64.tar.gz && \
+            echo "Extracting OpenCilk..." && \
+            tar -xzf opencilk/opencilk.tar.gz -C opencilk && \
+            if [ -f "$(OPENCILK_CLANGXX)" ] && [ -f "$(OPENCILK_CLANG)" ]; then \
+                echo "OpenCilk setup successful. Using $(OPENCILK_DIR)"; \
+                echo "$(OPENCILK_DIR)"; \
+            else \
+                echo "Error: OpenCilk setup failed. clang++ or clang not found after extraction." >&2; \
+                exit 1; \
+            fi \
+        )
+        # Check if CILK_HOME was set successfully
+        ifneq ($(CILK_HOME),$(OPENCILK_DIR))
+            $(error Failed to download and set up OpenCilk. \
+			        Please set CILK_HOME manually, \
+					or remove ./opencilk and retry.)
+        endif
+    endif
 endif
 
 CXX = $(CILK_HOME)/bin/clang++ -std=c++17
