@@ -3,6 +3,7 @@
 # Build GraphOne
 pushd GraphOne
 cmake -S . -B build
+cmake --build build
 popd
 
 # Build XPGraph
