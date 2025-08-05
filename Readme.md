@@ -1,6 +1,6 @@
-# Dynamic Graph Systems
+**Dynamic Graph Systems**
 
-SOTA dynamic graph systems, cloned from offical repositories, and fixed some compilation issues.
+This repository contains state-of-the-art dynamic graph systems, cloned from official sources. We've fixed compilation issues to ensure they run smoothly.
 
-This branch is used to reproduce the related work of Bubble (SC25).
+This branch is specifically for reproducing the results of our work, Bubble (SC25).
 

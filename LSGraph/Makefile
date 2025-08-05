@@ -50,7 +50,7 @@ ifndef CILK_HOME
                 echo "opencilk.tar.gz already exists and MD5 is correct." >&2; \
             else \
                 echo "Downloading OpenCilk..." >&2 && \
-                wget -O $$TAR_FILE https://github.com/OpenCilk/opencilk-project/releases/download/opencilk%2Fv1.0/OpenCilk-1.0-LLVM-10.0.1-Ubuntu-20.04-x86_64.tar.gz; \
+                wget -c -O $$TAR_FILE https://github.com/OpenCilk/opencilk-project/releases/download/opencilk%2Fv1.0/OpenCilk-1.0-LLVM-10.0.1-Ubuntu-20.04-x86_64.tar.gz; \
             fi && \
             echo "Extracting OpenCilk..." >&2 && \
             tar -xzf opencilk/opencilk.tar.gz -C opencilk && \
