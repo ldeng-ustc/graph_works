@@ -8,13 +8,12 @@
 #include <iostream>
 #include <numeric>
 #include <random>
-#include <csignal>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
-#include <unistd.h>
 
 #include "livegraph.hpp"
 
@@ -31,58 +30,11 @@ struct Edge32 {
 
 static_assert(sizeof(Edge32) == sizeof(uint32_t) * 2, "Edge32 must be 8 bytes");
 
-static volatile std::sig_atomic_t g_current_signal_edge_low = 0;
-static volatile std::sig_atomic_t g_current_signal_edge_high = 0;
-static volatile std::sig_atomic_t g_current_signal_batch_begin_low = 0;
-static volatile std::sig_atomic_t g_current_signal_batch_begin_high = 0;
-static volatile std::sig_atomic_t g_current_signal_batch_end_low = 0;
-static volatile std::sig_atomic_t g_current_signal_batch_end_high = 0;
-static volatile std::sig_atomic_t g_current_src = 0;
-static volatile std::sig_atomic_t g_current_dst = 0;
-
-void store_u64(volatile std::sig_atomic_t& low,
-               volatile std::sig_atomic_t& high,
-               std::uint64_t value) {
-    low = static_cast<std::sig_atomic_t>(value & 0xffffffffULL);
-    high = static_cast<std::sig_atomic_t>((value >> 32) & 0xffffffffULL);
-}
-
-std::uint64_t load_u64(volatile std::sig_atomic_t& low, volatile std::sig_atomic_t& high) {
-    return (static_cast<std::uint64_t>(static_cast<uint32_t>(high)) << 32) |
-           static_cast<uint32_t>(low);
-}
-
-void debug_signal_handler(int signum) {
-    char buffer[512];
-    int written = std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "\n[signal] caught signal=%d current_edge=%llu batch=[%llu,%llu) last_edge=(%u,%u)\n",
-        signum,
-        static_cast<unsigned long long>(load_u64(g_current_signal_edge_low, g_current_signal_edge_high)),
-        static_cast<unsigned long long>(
-            load_u64(g_current_signal_batch_begin_low, g_current_signal_batch_begin_high)),
-        static_cast<unsigned long long>(
-            load_u64(g_current_signal_batch_end_low, g_current_signal_batch_end_high)),
-        static_cast<unsigned int>(g_current_src),
-        static_cast<unsigned int>(g_current_dst));
-    if (written > 0) {
-        ::write(STDERR_FILENO, buffer, static_cast<size_t>(written));
-    }
-    std::_Exit(128 + signum);
-}
-
-void install_debug_signal_handlers() {
-    std::signal(SIGSEGV, debug_signal_handler);
-    std::signal(SIGFPE, debug_signal_handler);
-    std::signal(SIGABRT, debug_signal_handler);
-    std::signal(SIGBUS, debug_signal_handler);
-}
-
 struct Options {
     std::string input_path;
     std::string storage_dir;
     size_t batch_size = 1 << 20;
+    size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
     size_t pr_iterations = 10;
     double pr_epsilon = 0.0;
     size_t bfs_rounds = 20;
@@ -103,6 +55,7 @@ void print_usage(const char* argv0) {
         << "Options:\n"
         << "  --storage <dir>       Storage root, default ../data/livegraph-bench/<dataset>\n"
         << "  --batch-size <n>      Edge ingest batch size, default 1048576\n"
+        << "  --threads <n>         Worker thread count, default hardware concurrency\n"
         << "  --pr-iters <n>        PageRank iterations, default 10\n"
         << "  --pr-epsilon <x>      PageRank early-stop epsilon, default 0\n"
         << "  --bfs-rounds <n>      BFS rounds, default 20\n"
@@ -127,6 +80,8 @@ Options parse_args(int argc, char* argv[]) {
             opts.storage_dir = require_value("--storage");
         } else if (arg == "--batch-size") {
             opts.batch_size = std::stoull(require_value("--batch-size"));
+        } else if (arg == "--threads") {
+            opts.num_threads = std::stoull(require_value("--threads"));
         } else if (arg == "--pr-iters") {
             opts.pr_iterations = std::stoull(require_value("--pr-iters"));
         } else if (arg == "--pr-epsilon") {
@@ -150,6 +105,9 @@ Options parse_args(int argc, char* argv[]) {
     }
     if (opts.batch_size == 0) {
         throw std::runtime_error("--batch-size must be > 0");
+    }
+    if (opts.num_threads == 0) {
+        throw std::runtime_error("--threads must be > 0");
     }
     return opts;
 }
@@ -248,11 +206,43 @@ bool compare_and_swap(uint32_t& x, uint32_t old_val, uint32_t new_val) {
     return __sync_bool_compare_and_swap(&x, old_val, new_val);
 }
 
-template <typename ForOutNeighbors, typename ForInNeighbors>
+size_t clamp_thread_count(size_t requested, size_t work_items) {
+    if (work_items == 0) {
+        return 1;
+    }
+    return std::max<size_t>(1, std::min(requested, work_items));
+}
+
+template <typename Fn>
+void parallel_for_ranges(size_t work_items, size_t num_threads, Fn&& fn) {
+    size_t threads = clamp_thread_count(num_threads, work_items);
+    if (threads == 1) {
+        fn(0, work_items, 0);
+        return;
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(threads);
+    size_t block = (work_items + threads - 1) / threads;
+    for (size_t tid = 0; tid < threads; ++tid) {
+        size_t begin = tid * block;
+        size_t end = std::min(begin + block, work_items);
+        if (begin >= end) {
+            break;
+        }
+        workers.emplace_back([&, begin, end, tid]() { fn(begin, end, tid); });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+}
+
+template <typename MakeOutNeighbors, typename MakeInNeighbors>
 size_t run_gapbs_bfs(uint32_t num_vertices,
                      uint32_t source,
-                     ForOutNeighbors&& for_out_neighbors,
-                     ForInNeighbors&& for_in_neighbors) {
+                     size_t num_threads,
+                     MakeOutNeighbors&& make_out_neighbors,
+                     MakeInNeighbors&& make_in_neighbors) {
     if (num_vertices == 0) {
         return 0;
     }
@@ -270,34 +260,42 @@ size_t run_gapbs_bfs(uint32_t num_vertices,
     do {
         frontier = 0;
         const char* mode = top_down ? "top-down" : "bottom-up";
-        if (top_down) {
-            for (uint32_t v = 0; v < num_vertices; ++v) {
-                if (status[v] != level) {
-                    continue;
-                }
-                for_out_neighbors(v, [&](uint32_t dst) {
-                    if (dst < num_vertices && status[dst] == 0) {
-                        status[dst] = level + 1;
-                        ++frontier;
+        std::vector<size_t> local_frontiers(clamp_thread_count(num_threads, num_vertices), 0);
+        parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t tid) {
+            auto for_out_neighbors = make_out_neighbors();
+            auto for_in_neighbors = make_in_neighbors();
+            size_t local_frontier = 0;
+            if (top_down) {
+                for (size_t v = begin; v < end; ++v) {
+                    if (status[v] != level) {
+                        continue;
                     }
-                    return true;
-                });
-            }
-        } else {
-            for (uint32_t v = 0; v < num_vertices; ++v) {
-                if (status[v] != 0) {
-                    continue;
+                    for_out_neighbors(static_cast<uint32_t>(v), [&](uint32_t dst) {
+                        if (dst < num_vertices && compare_and_swap(status[dst], 0, level + 1)) {
+                            ++local_frontier;
+                        }
+                        return true;
+                    });
                 }
-                for_in_neighbors(v, [&](uint32_t src) {
-                    if (src < num_vertices && status[src] == level) {
-                        status[v] = level + 1;
-                        ++frontier;
-                        return false;
+            } else {
+                for (size_t v = begin; v < end; ++v) {
+                    if (status[v] != 0) {
+                        continue;
                     }
-                    return true;
-                });
+                    for_in_neighbors(static_cast<uint32_t>(v), [&](uint32_t src) {
+                        if (src < num_vertices &&
+                            status[src] == level &&
+                            compare_and_swap(status[v], 0, level + 1)) {
+                            ++local_frontier;
+                            return false;
+                        }
+                        return status[v] == 0;
+                    });
+                }
             }
-        }
+            local_frontiers[tid] = local_frontier;
+        });
+        frontier = std::accumulate(local_frontiers.begin(), local_frontiers.end(), size_t{0});
         visited_count += frontier;
         std::printf("[bfs] level=%u mode=%s new_frontier=%zu visited=%zu\n",
                     level,
@@ -312,12 +310,13 @@ size_t run_gapbs_bfs(uint32_t num_vertices,
     return visited_count;
 }
 
-template <typename ForNeighbors>
+template <typename MakeInNeighbors>
 double run_gapbs_pr(uint32_t num_vertices,
                     const std::vector<uint32_t>& out_degree,
+                    size_t num_threads,
                     size_t iterations,
                     double epsilon,
-                    ForNeighbors&& for_in_neighbors) {
+                    MakeInNeighbors&& make_in_neighbors) {
     if (num_vertices == 0) {
         return 0.0;
     }
@@ -329,27 +328,44 @@ double run_gapbs_pr(uint32_t num_vertices,
 
     std::vector<ScoreT> scores(num_vertices, init_score);
     std::vector<ScoreT> outgoing_contrib(num_vertices, 0.0f);
-    for (uint32_t n = 0; n < num_vertices; ++n) {
-        outgoing_contrib[n] =
-            out_degree[n] == 0 ? 0.0f : init_score / static_cast<ScoreT>(out_degree[n]);
-    }
+    parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t) {
+        for (size_t n = begin; n < end; ++n) {
+            outgoing_contrib[n] =
+                out_degree[n] == 0 ? 0.0f : init_score / static_cast<ScoreT>(out_degree[n]);
+        }
+    });
 
     for (size_t iter = 0; iter < iterations; ++iter) {
         double error = 0.0;
-        for (uint32_t u = 0; u < num_vertices; ++u) {
-            ScoreT incoming_total = 0.0f;
-            for_in_neighbors(u, [&](uint32_t src) {
-                if (src < num_vertices) {
-                    incoming_total += outgoing_contrib[src];
-                }
-                return true;
-            });
-            ScoreT old_score = scores[u];
-            scores[u] = base_score + kDamp * incoming_total;
-            error += std::fabs(scores[u] - old_score);
-            outgoing_contrib[u] =
-                out_degree[u] == 0 ? 0.0f : scores[u] / static_cast<ScoreT>(out_degree[u]);
-        }
+        std::vector<ScoreT> prev_outgoing_contrib = outgoing_contrib;
+        std::vector<double> local_errors(clamp_thread_count(num_threads, num_vertices), 0.0);
+        auto iter_begin = std::chrono::steady_clock::now();
+        parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t tid) {
+            auto for_in_neighbors = make_in_neighbors();
+            double local_error = 0.0;
+            for (size_t u = begin; u < end; ++u) {
+                ScoreT incoming_total = 0.0f;
+                for_in_neighbors(static_cast<uint32_t>(u), [&](uint32_t src) {
+                    if (src < num_vertices) {
+                        incoming_total += prev_outgoing_contrib[src];
+                    }
+                    return true;
+                });
+                ScoreT old_score = scores[u];
+                scores[u] = base_score + kDamp * incoming_total;
+                local_error += std::fabs(scores[u] - old_score);
+                outgoing_contrib[u] =
+                    out_degree[u] == 0 ? 0.0f : scores[u] / static_cast<ScoreT>(out_degree[u]);
+            }
+            local_errors[tid] = local_error;
+        });
+        error = std::accumulate(local_errors.begin(), local_errors.end(), 0.0);
+        auto iter_end = std::chrono::steady_clock::now();
+        std::printf("[pr] iter=%zu error=%.6f time=%.4f\n",
+                    iter + 1,
+                    error,
+                    std::chrono::duration<double>(iter_end - iter_begin).count());
+        std::fflush(stdout);
         if (error < epsilon) {
             break;
         }
@@ -400,58 +416,79 @@ uint32_t sample_frequent_element(uint32_t* comp, uint32_t num_vertices, size_t n
     return most_frequent->first;
 }
 
-template <typename ForOutNeighbors, typename ForInNeighbors>
+template <typename MakeOutNeighbors, typename MakeInNeighbors>
 size_t run_gapbs_cc(uint32_t num_vertices,
                     size_t neighbor_rounds,
-                    ForOutNeighbors&& for_out_neighbors,
-                    ForInNeighbors&& for_in_neighbors) {
+                    size_t num_threads,
+                    MakeOutNeighbors&& make_out_neighbors,
+                    MakeInNeighbors&& make_in_neighbors) {
     if (num_vertices == 0) {
         return 0;
     }
 
     std::vector<uint32_t> comp(num_vertices);
-    for (uint32_t v = 0; v < num_vertices; ++v) {
-        comp[v] = v;
-    }
-
-    for (uint32_t u = 0; u < num_vertices; ++u) {
-        size_t d = 0;
-        for_out_neighbors(u, [&](uint32_t v) {
-            if (d < neighbor_rounds && v < num_vertices) {
-                link_components(u, v, comp.data());
-                ++d;
-                return d < neighbor_rounds;
-            }
-            return false;
-        });
-    }
-    compress_components(num_vertices, comp.data());
-
-    uint32_t largest_component = sample_frequent_element(comp.data(), num_vertices);
-    for (uint32_t u = 0; u < num_vertices; ++u) {
-        if (comp[u] == largest_component) {
-            continue;
+    parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t) {
+        for (size_t v = begin; v < end; ++v) {
+            comp[v] = static_cast<uint32_t>(v);
         }
+    });
 
-        size_t d = 0;
-        for_out_neighbors(u, [&](uint32_t v) {
-            if (d > neighbor_rounds && v < num_vertices) {
-                link_components(u, v, comp.data());
-            }
-            ++d;
-            return true;
-        });
-
-        d = 0;
-        for_in_neighbors(u, [&](uint32_t v) {
-            if (d > neighbor_rounds && v < num_vertices) {
-                link_components(u, v, comp.data());
-            }
-            ++d;
-            return true;
-        });
-    }
+    auto sample_begin = std::chrono::steady_clock::now();
+    parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t) {
+        auto for_out_neighbors = make_out_neighbors();
+        for (size_t u = begin; u < end; ++u) {
+            size_t d = 0;
+            for_out_neighbors(static_cast<uint32_t>(u), [&](uint32_t v) {
+                if (d < neighbor_rounds && v < num_vertices) {
+                    link_components(static_cast<uint32_t>(u), v, comp.data());
+                    ++d;
+                    return d < neighbor_rounds;
+                }
+                return false;
+            });
+        }
+    });
     compress_components(num_vertices, comp.data());
+    auto sample_end = std::chrono::steady_clock::now();
+    uint32_t largest_component = sample_frequent_element(comp.data(), num_vertices);
+    std::printf("[cc] sample+compress time=%.4f largest_component=%u\n",
+                std::chrono::duration<double>(sample_end - sample_begin).count(),
+                largest_component);
+    std::fflush(stdout);
+
+    auto link_begin = std::chrono::steady_clock::now();
+    parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t) {
+        auto for_out_neighbors = make_out_neighbors();
+        auto for_in_neighbors = make_in_neighbors();
+        for (size_t u = begin; u < end; ++u) {
+            if (comp[u] == largest_component) {
+                continue;
+            }
+
+            size_t d = 0;
+            for_out_neighbors(static_cast<uint32_t>(u), [&](uint32_t v) {
+                if (d > neighbor_rounds && v < num_vertices) {
+                    link_components(static_cast<uint32_t>(u), v, comp.data());
+                }
+                ++d;
+                return true;
+            });
+
+            d = 0;
+            for_in_neighbors(static_cast<uint32_t>(u), [&](uint32_t v) {
+                if (d > neighbor_rounds && v < num_vertices) {
+                    link_components(static_cast<uint32_t>(u), v, comp.data());
+                }
+                ++d;
+                return true;
+            });
+        }
+    });
+    compress_components(num_vertices, comp.data());
+    auto link_end = std::chrono::steady_clock::now();
+    std::printf("[cc] final-link+compress time=%.4f\n",
+                std::chrono::duration<double>(link_end - link_begin).count());
+    std::fflush(stdout);
 
     size_t components = 0;
     for (uint32_t v = 0; v < num_vertices; ++v) {
@@ -464,10 +501,11 @@ size_t run_gapbs_cc(uint32_t num_vertices,
 
 int main(int argc, char* argv[]) {
     try {
-        install_debug_signal_handlers();
         const auto bench_begin = std::chrono::steady_clock::now();
         Options opts = parse_args(argc, argv);
         log_progress("parsed arguments");
+        std::printf("[progress] threads=%zu batch_size=%zu\n", opts.num_threads, opts.batch_size);
+        std::fflush(stdout);
         if (opts.storage_dir.empty()) {
             opts.storage_dir = "../data/livegraph-bench/" + dataset_name_from_path(opts.input_path);
         }
@@ -519,23 +557,19 @@ int main(int argc, char* argv[]) {
         log_progress("starting edge ingest");
         for (size_t begin = 0; begin < loaded.edges.size(); begin += opts.batch_size) {
             size_t end = std::min(begin + opts.batch_size, loaded.edges.size());
-            store_u64(g_current_signal_batch_begin_low, g_current_signal_batch_begin_high, begin);
-            store_u64(g_current_signal_batch_end_low, g_current_signal_batch_end_high, end);
             std::printf("[progress] edge batch begin: [%zu, %zu)\n", begin, end);
             std::fflush(stdout);
-            auto tx = graph.begin_batch_loader();
-            for (size_t i = begin; i < end; ++i) {
-                const auto& edge = loaded.edges[i];
-                store_u64(g_current_signal_edge_low, g_current_signal_edge_high, i);
-                g_current_src = static_cast<std::sig_atomic_t>(edge.src);
-                g_current_dst = static_cast<std::sig_atomic_t>(edge.dst);
-                tx.put_edge(edge.src, 0, edge.dst, std::string_view());
-                tx.put_edge(edge.dst, 1, edge.src, std::string_view());
-            }
-            std::printf("[progress] edge batch commit start: [%zu, %zu)\n", begin, end);
-            std::fflush(stdout);
-            tx.commit();
-            std::printf("[progress] edge batch commit done: [%zu, %zu)\n", begin, end);
+            size_t batch_edges = end - begin;
+            parallel_for_ranges(batch_edges, opts.num_threads, [&](size_t local_begin, size_t local_end, size_t) {
+                auto tx = graph.begin_batch_loader();
+                for (size_t i = begin + local_begin; i < begin + local_end; ++i) {
+                    const auto& edge = loaded.edges[i];
+                    tx.put_edge(edge.src, 0, edge.dst, std::string_view());
+                    tx.put_edge(edge.dst, 1, edge.src, std::string_view());
+                }
+                tx.commit();
+            });
+            std::printf("[progress] edge batch done: [%zu, %zu)\n", begin, end);
             std::fflush(stdout);
             if (end >= next_progress || end == loaded.edges.size()) {
                 std::printf("[progress] edge ingest: %zu / %zu (%.1f%%)\n",
@@ -552,9 +586,8 @@ int main(int argc, char* argv[]) {
 
         double bfs_seconds = 0.0;
         size_t bfs_checksum = 0;
-        {
-            auto tx = graph.begin_read_only_transaction();
-            auto with_out_neighbors = [&](uint32_t src, auto&& fn) {
+        auto make_out_neighbors = [&graph]() {
+            return [tx = graph.begin_read_only_transaction()](uint32_t src, auto&& fn) mutable {
                 auto it = tx.get_edges(src, 0);
                 while (it.valid()) {
                     uint32_t dst = static_cast<uint32_t>(it.dst_id());
@@ -564,7 +597,9 @@ int main(int argc, char* argv[]) {
                     it.next();
                 }
             };
-            auto with_in_neighbors = [&](uint32_t dst, auto&& fn) {
+        };
+        auto make_in_neighbors = [&graph]() {
+            return [tx = graph.begin_read_only_transaction()](uint32_t dst, auto&& fn) mutable {
                 auto it = tx.get_edges(dst, 1);
                 while (it.valid()) {
                     uint32_t src = static_cast<uint32_t>(it.dst_id());
@@ -574,66 +609,69 @@ int main(int argc, char* argv[]) {
                     it.next();
                 }
             };
+        };
 
-            for (size_t round = 0; round < opts.bfs_rounds; ++round) {
-                uint32_t source = select_bfs_source(round, loaded.out_degree);
-                std::printf("[progress] bfs round %zu / %zu, source=%u\n",
-                            round + 1,
-                            opts.bfs_rounds,
-                            source);
-                std::fflush(stdout);
-                auto t0 = std::chrono::steady_clock::now();
-                bfs_checksum +=
-                    run_gapbs_bfs(loaded.num_vertices, source, with_out_neighbors, with_in_neighbors);
-                auto t1 = std::chrono::steady_clock::now();
-                bfs_seconds += std::chrono::duration<double>(t1 - t0).count();
-            }
-
-            auto pr_t0 = std::chrono::steady_clock::now();
-            log_progress("starting pagerank");
-            double pr_sum = run_gapbs_pr(
-                loaded.num_vertices,
-                loaded.out_degree,
-                opts.pr_iterations,
-                opts.pr_epsilon,
-                with_in_neighbors);
-            auto pr_t1 = std::chrono::steady_clock::now();
-            double pr_seconds = std::chrono::duration<double>(pr_t1 - pr_t0).count();
-            log_progress("finished pagerank");
-
-            auto cc_t0 = std::chrono::steady_clock::now();
-            log_progress("starting connected components");
-            size_t cc_components = run_gapbs_cc(
-                loaded.num_vertices,
-                opts.cc_neighbor_rounds,
-                with_out_neighbors,
-                with_in_neighbors);
-            auto cc_t1 = std::chrono::steady_clock::now();
-            double cc_seconds = std::chrono::duration<double>(cc_t1 - cc_t0).count();
-            log_progress("finished connected components");
-
-            double load_seconds = std::chrono::duration<double>(ts_load_end - ts_load_begin).count();
-            double ingest_seconds = std::chrono::duration<double>(ts_ingest_end - ts_ingest_begin).count();
-            double total_seconds =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - bench_begin).count();
-            double ingest_bandwidth =
-                ingest_seconds > 0.0 ? static_cast<double>(loaded.edges.size()) / ingest_seconds / 1e6 : 0.0;
-
-            std::printf(EXPOUT "Dataset: %s\n", opts.input_path.c_str());
-            std::printf(EXPOUT "StorageDir: %s\n", opts.storage_dir.c_str());
-            std::printf(EXPOUT "Vertex count: %u\n", loaded.num_vertices);
-            std::printf(EXPOUT "Edge count: %zu\n", loaded.edges.size());
-            std::printf(EXPOUT "Load: %.4f\n", load_seconds);
-            std::printf(EXPOUT "Ingest: %.4f\n", ingest_seconds);
-            std::printf(EXPOUT "BFS: %.4f\n", bfs_seconds);
-            std::printf(EXPOUT "PR: %.4f\n", pr_seconds);
-            std::printf(EXPOUT "CC: %.4f\n", cc_seconds);
-            std::printf(EXPOUT "BFS_Checksum: %zu\n", bfs_checksum);
-            std::printf(EXPOUT "PR_Sum: %.8f\n", pr_sum);
-            std::printf(EXPOUT "CC_Components: %zu\n", cc_components);
-            std::printf(EXPOUT "Total: %.4f\n", total_seconds);
-            std::printf("Ingest bandwidth: %.4fM Edges/s\n", ingest_bandwidth);
+        for (size_t round = 0; round < opts.bfs_rounds; ++round) {
+            uint32_t source = select_bfs_source(round, loaded.out_degree);
+            std::printf("[progress] bfs round %zu / %zu, source=%u\n",
+                        round + 1,
+                        opts.bfs_rounds,
+                        source);
+            std::fflush(stdout);
+            auto t0 = std::chrono::steady_clock::now();
+            bfs_checksum += run_gapbs_bfs(
+                loaded.num_vertices, source, opts.num_threads, make_out_neighbors, make_in_neighbors);
+            auto t1 = std::chrono::steady_clock::now();
+            bfs_seconds += std::chrono::duration<double>(t1 - t0).count();
         }
+
+        auto pr_t0 = std::chrono::steady_clock::now();
+        log_progress("starting pagerank");
+        double pr_sum = run_gapbs_pr(
+            loaded.num_vertices,
+            loaded.out_degree,
+            opts.num_threads,
+            opts.pr_iterations,
+            opts.pr_epsilon,
+            make_in_neighbors);
+        auto pr_t1 = std::chrono::steady_clock::now();
+        double pr_seconds = std::chrono::duration<double>(pr_t1 - pr_t0).count();
+        log_progress("finished pagerank");
+
+        auto cc_t0 = std::chrono::steady_clock::now();
+        log_progress("starting connected components");
+        size_t cc_components = run_gapbs_cc(
+            loaded.num_vertices,
+            opts.cc_neighbor_rounds,
+            opts.num_threads,
+            make_out_neighbors,
+            make_in_neighbors);
+        auto cc_t1 = std::chrono::steady_clock::now();
+        double cc_seconds = std::chrono::duration<double>(cc_t1 - cc_t0).count();
+        log_progress("finished connected components");
+
+        double load_seconds = std::chrono::duration<double>(ts_load_end - ts_load_begin).count();
+        double ingest_seconds = std::chrono::duration<double>(ts_ingest_end - ts_ingest_begin).count();
+        double total_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - bench_begin).count();
+        double ingest_bandwidth =
+            ingest_seconds > 0.0 ? static_cast<double>(loaded.edges.size()) / ingest_seconds / 1e6 : 0.0;
+
+        std::printf(EXPOUT "Dataset: %s\n", opts.input_path.c_str());
+        std::printf(EXPOUT "StorageDir: %s\n", opts.storage_dir.c_str());
+        std::printf(EXPOUT "Vertex count: %u\n", loaded.num_vertices);
+        std::printf(EXPOUT "Edge count: %zu\n", loaded.edges.size());
+        std::printf(EXPOUT "Threads: %zu\n", opts.num_threads);
+        std::printf(EXPOUT "Load: %.4f\n", load_seconds);
+        std::printf(EXPOUT "Ingest: %.4f\n", ingest_seconds);
+        std::printf(EXPOUT "BFS: %.4f\n", bfs_seconds);
+        std::printf(EXPOUT "PR: %.4f\n", pr_seconds);
+        std::printf(EXPOUT "CC: %.4f\n", cc_seconds);
+        std::printf(EXPOUT "BFS_Checksum: %zu\n", bfs_checksum);
+        std::printf(EXPOUT "PR_Sum: %.8f\n", pr_sum);
+        std::printf(EXPOUT "CC_Components: %zu\n", cc_components);
+        std::printf(EXPOUT "Total: %.4f\n", total_seconds);
+        std::printf("Ingest bandwidth: %.4fM Edges/s\n", ingest_bandwidth);
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
