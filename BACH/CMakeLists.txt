@@ -12,6 +12,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 project ("BACH_demo" LANGUAGES CXX)
 
 include(FetchContent)
+find_package(OpenMP REQUIRED)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -76,7 +77,7 @@ target_compile_features(bach PUBLIC cxx_std_20)
 add_executable(bach_bin32_bench bach_bin32_bench.cpp)
 target_include_directories(bach_bin32_bench PRIVATE include)
 target_compile_features(bach_bin32_bench PRIVATE cxx_std_20)
-target_link_libraries(bach_bin32_bench PRIVATE bach)
+target_link_libraries(bach_bin32_bench PRIVATE bach OpenMP::OpenMP_CXX)
 
 set(DEBUG OFF)
 

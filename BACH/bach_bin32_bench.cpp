@@ -11,11 +11,14 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <omp.h>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unistd.h>
 #include <vector>
 
 #include "BACH/BACH.h"
@@ -41,6 +44,7 @@ struct Options {
         std::max<size_t>(1, std::thread::hardware_concurrency() == 0
                                 ? 1
                                 : std::thread::hardware_concurrency());
+    size_t algo_threads = 0;
     size_t pr_iterations = 10;
     double pr_epsilon = 0.0;
     size_t bfs_rounds = 20;
@@ -62,7 +66,8 @@ void print_usage(const char* argv0) {
         << "Options:\n"
         << "  --storage <dir>       Storage root, default ../data/bach-bench/<dataset>\n"
         << "  --ingest-batch-edges <n>  Edge count per ingest transaction, default 1048576\n"
-        << "  --threads <n>         Worker threads for ingest experiment, default hardware concurrency\n"
+        << "  --threads <n>         Worker threads for ingest, default hardware concurrency\n"
+        << "  --algo-threads <n>    Worker threads for BFS/PR/CC, default same as --threads\n"
         << "  --pr-iters <n>        PageRank iterations, default 10\n"
         << "  --pr-epsilon <x>      PageRank early-stop epsilon, default 0\n"
         << "  --bfs-rounds <n>      BFS rounds, default 20\n"
@@ -90,6 +95,8 @@ Options parse_args(int argc, char* argv[]) {
             opts.ingest_batch_edges = std::stoull(require_value("--ingest-batch-edges"));
         } else if (arg == "--threads") {
             opts.num_threads = std::stoull(require_value("--threads"));
+        } else if (arg == "--algo-threads") {
+            opts.algo_threads = std::stoull(require_value("--algo-threads"));
         } else if (arg == "--pr-iters") {
             opts.pr_iterations = std::stoull(require_value("--pr-iters"));
         } else if (arg == "--pr-epsilon") {
@@ -113,6 +120,9 @@ Options parse_args(int argc, char* argv[]) {
     if (opts.input_path.empty()) {
         throw std::runtime_error("Please specify -f <graph.bin32>");
     }
+    if (opts.algo_threads == 0) {
+        opts.algo_threads = opts.num_threads;
+    }
     return opts;
 }
 
@@ -120,56 +130,24 @@ double seconds_since(const std::chrono::steady_clock::time_point& begin) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
 }
 
+long get_rss() {
+    std::ifstream stat_file("/proc/self/stat");
+    std::string line;
+    std::getline(stat_file, line);
+    std::istringstream iss(line);
+    std::string token;
+    for (int i = 0; i < 23; ++i) {
+        iss >> token;
+    }
+    iss >> token;
+    return std::stol(token) * sysconf(_SC_PAGESIZE);
+}
+
 size_t clamp_thread_count(size_t requested_threads, size_t work_items) {
     if (work_items == 0) {
         return 1;
     }
     return std::max<size_t>(1, std::min(requested_threads, work_items));
-}
-
-template <typename Fn>
-void parallel_for_ranges(size_t work_items, size_t requested_threads, Fn&& fn) {
-    size_t threads = clamp_thread_count(requested_threads, work_items);
-    if (threads <= 1) {
-        fn(0, work_items, 0);
-        return;
-    }
-
-    const size_t base = work_items / threads;
-    const size_t extra = work_items % threads;
-    std::vector<std::thread> workers;
-    workers.reserve(threads);
-    std::atomic<bool> failed(false);
-    std::exception_ptr first_exception;
-    std::mutex exception_mutex;
-
-    size_t begin = 0;
-    for (size_t tid = 0; tid < threads; ++tid) {
-        const size_t size = base + (tid < extra ? 1 : 0);
-        const size_t end = begin + size;
-        workers.emplace_back([&, begin, end, tid]() {
-            if (failed.load(std::memory_order_relaxed)) {
-                return;
-            }
-            try {
-                fn(begin, end, tid);
-            } catch (...) {
-                failed.store(true, std::memory_order_relaxed);
-                std::lock_guard<std::mutex> lock(exception_mutex);
-                if (!first_exception) {
-                    first_exception = std::current_exception();
-                }
-            }
-        });
-        begin = end;
-    }
-
-    for (auto& worker : workers) {
-        worker.join();
-    }
-    if (first_exception) {
-        std::rethrow_exception(first_exception);
-    }
 }
 
 std::string dataset_name_from_path(const std::string& path) {
@@ -274,40 +252,40 @@ size_t run_gapbs_bfs(uint32_t num_vertices,
     do {
         frontier = 0;
         const char* mode = top_down ? "top-down" : "bottom-up";
-        std::vector<size_t> local_frontiers(clamp_thread_count(num_threads, num_vertices), 0);
-        parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t tid) {
-            size_t local_frontier = 0;
-            if (top_down) {
-                for (size_t v = begin; v < end; ++v) {
-                    if (status[v] != level) {
-                        continue;
-                    }
-                    for_out_neighbors(tid, static_cast<uint32_t>(v), [&](uint32_t dst) {
-                        if (dst < num_vertices && compare_and_swap(status[dst], 0, level + 1)) {
-                            ++local_frontier;
-                        }
-                        return true;
-                    });
+        int threads = static_cast<int>(clamp_thread_count(num_threads, num_vertices));
+        if (top_down) {
+            #pragma omp parallel for num_threads(threads) schedule(dynamic, 16384) reduction(+:frontier)
+            for (int64_t v = 0; v < static_cast<int64_t>(num_vertices); ++v) {
+                if (status[static_cast<size_t>(v)] != level) {
+                    continue;
                 }
-            } else {
-                for (size_t v = begin; v < end; ++v) {
-                    if (status[v] != 0) {
-                        continue;
+                size_t tid = static_cast<size_t>(omp_get_thread_num());
+                for_out_neighbors(tid, static_cast<uint32_t>(v), [&](uint32_t dst) {
+                    if (dst < num_vertices &&
+                        compare_and_swap(status[static_cast<size_t>(dst)], 0, level + 1)) {
+                        ++frontier;
                     }
-                    for_in_neighbors(tid, static_cast<uint32_t>(v), [&](uint32_t src) {
-                        if (src < num_vertices &&
-                            status[src] == level &&
-                            compare_and_swap(status[v], 0, level + 1)) {
-                            ++local_frontier;
-                            return false;
-                        }
-                        return status[v] == 0;
-                    });
-                }
+                    return true;
+                });
             }
-            local_frontiers[tid] = local_frontier;
-        });
-        frontier = std::accumulate(local_frontiers.begin(), local_frontiers.end(), size_t{0});
+        } else {
+            #pragma omp parallel for num_threads(threads) schedule(dynamic, 16384) reduction(+:frontier)
+            for (int64_t v = 0; v < static_cast<int64_t>(num_vertices); ++v) {
+                if (status[static_cast<size_t>(v)] != 0) {
+                    continue;
+                }
+                size_t tid = static_cast<size_t>(omp_get_thread_num());
+                for_in_neighbors(tid, static_cast<uint32_t>(v), [&](uint32_t src) {
+                    if (src < num_vertices &&
+                        status[static_cast<size_t>(src)] == level &&
+                        compare_and_swap(status[static_cast<size_t>(v)], 0, level + 1)) {
+                        ++frontier;
+                        return false;
+                    }
+                    return status[static_cast<size_t>(v)] == 0;
+                });
+            }
+        }
         visited_count += frontier;
         std::printf("[bfs] level=%u mode=%s new_frontier=%zu visited=%zu\n",
                     level,
@@ -339,36 +317,43 @@ double run_gapbs_pr(uint32_t num_vertices,
 
     std::vector<ScoreT> scores(num_vertices, init_score);
     std::vector<ScoreT> outgoing_contrib(num_vertices, 0.0f);
-    parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t) {
-        for (size_t n = begin; n < end; ++n) {
-            outgoing_contrib[n] =
-                out_degree[n] == 0 ? 0.0f : init_score / static_cast<ScoreT>(out_degree[n]);
-        }
-    });
+    int threads = static_cast<int>(clamp_thread_count(num_threads, num_vertices));
+    #pragma omp parallel for num_threads(threads) schedule(static)
+    for (int64_t n = 0; n < static_cast<int64_t>(num_vertices); ++n) {
+        outgoing_contrib[static_cast<size_t>(n)] =
+            out_degree[static_cast<size_t>(n)] == 0
+                ? 0.0f
+                : init_score / static_cast<ScoreT>(out_degree[static_cast<size_t>(n)]);
+    }
 
     for (size_t iter = 0; iter < iterations; ++iter) {
         auto iter_begin = std::chrono::steady_clock::now();
         std::vector<ScoreT> prev_outgoing_contrib = outgoing_contrib;
-        std::vector<double> local_errors(clamp_thread_count(num_threads, num_vertices), 0.0);
-        parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t tid) {
-            double local_error = 0.0;
-            for (size_t u = begin; u < end; ++u) {
-                ScoreT incoming_total = 0.0f;
-                for_in_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t src) {
-                    if (src < num_vertices) {
-                        incoming_total += prev_outgoing_contrib[src];
-                    }
-                    return true;
-                });
-                ScoreT old_score = scores[u];
-                scores[u] = base_score + kDamp * incoming_total;
-                local_error += std::fabs(scores[u] - old_score);
-                outgoing_contrib[u] =
-                    out_degree[u] == 0 ? 0.0f : scores[u] / static_cast<ScoreT>(out_degree[u]);
+        double error = 0.0;
+        #pragma omp parallel for num_threads(threads) schedule(dynamic, 16384) reduction(+:error)
+        for (int64_t u = 0; u < static_cast<int64_t>(num_vertices); ++u) {
+            ScoreT incoming_total = 0.0f;
+            bool has_incoming = false;
+            size_t tid = static_cast<size_t>(omp_get_thread_num());
+            for_in_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t src) {
+                if (src < num_vertices) {
+                    has_incoming = true;
+                    incoming_total += prev_outgoing_contrib[static_cast<size_t>(src)];
+                }
+                return true;
+            });
+            if (!has_incoming) {
+                continue;
             }
-            local_errors[tid] = local_error;
-        });
-        double error = std::accumulate(local_errors.begin(), local_errors.end(), 0.0);
+            ScoreT old_score = scores[static_cast<size_t>(u)];
+            scores[static_cast<size_t>(u)] = base_score + kDamp * incoming_total;
+            error += std::fabs(scores[static_cast<size_t>(u)] - old_score);
+            outgoing_contrib[static_cast<size_t>(u)] =
+                out_degree[static_cast<size_t>(u)] == 0
+                    ? 0.0f
+                    : scores[static_cast<size_t>(u)] /
+                          static_cast<ScoreT>(out_degree[static_cast<size_t>(u)]);
+        }
         if (error < epsilon) {
             std::printf("[pr] iter=%zu error=%.6f time=%.4f early-stop=1\n",
                         iter + 1,
@@ -401,10 +386,12 @@ void link_components(uint32_t u, uint32_t v, uint32_t* comp) {
     }
 }
 
-void compress_components(uint32_t num_vertices, uint32_t* comp) {
-    for (uint32_t n = 0; n < num_vertices; ++n) {
-        while (comp[n] != comp[comp[n]]) {
-            comp[n] = comp[comp[n]];
+void compress_components(uint32_t num_vertices, uint32_t* comp, size_t num_threads) {
+    int threads = static_cast<int>(clamp_thread_count(num_threads, num_vertices));
+    #pragma omp parallel for num_threads(threads) schedule(dynamic, 16384)
+    for (int64_t n = 0; n < static_cast<int64_t>(num_vertices); ++n) {
+        while (comp[static_cast<size_t>(n)] != comp[comp[static_cast<size_t>(n)]]) {
+            comp[static_cast<size_t>(n)] = comp[comp[static_cast<size_t>(n)]];
         }
     }
 }
@@ -435,59 +422,59 @@ size_t run_gapbs_cc(uint32_t num_vertices,
     }
 
     std::vector<uint32_t> comp(num_vertices);
-    parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t) {
-        for (size_t v = begin; v < end; ++v) {
-            comp[v] = static_cast<uint32_t>(v);
-        }
-    });
+    int threads = static_cast<int>(clamp_thread_count(num_threads, num_vertices));
+    #pragma omp parallel for num_threads(threads) schedule(static)
+    for (int64_t v = 0; v < static_cast<int64_t>(num_vertices); ++v) {
+        comp[static_cast<size_t>(v)] = static_cast<uint32_t>(v);
+    }
 
     auto sample_begin = std::chrono::steady_clock::now();
-    parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t tid) {
-        for (size_t u = begin; u < end; ++u) {
-            size_t d = 0;
-            for_out_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
-                if (d < neighbor_rounds && v < num_vertices) {
-                    link_components(static_cast<uint32_t>(u), v, comp.data());
-                    ++d;
-                    return d < neighbor_rounds;
-                }
-                return true;
-            });
-        }
-    });
-    compress_components(num_vertices, comp.data());
+    #pragma omp parallel for num_threads(threads) schedule(dynamic, 16384)
+    for (int64_t u = 0; u < static_cast<int64_t>(num_vertices); ++u) {
+        size_t d = 0;
+        size_t tid = static_cast<size_t>(omp_get_thread_num());
+        for_out_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
+            if (d < neighbor_rounds && v < num_vertices) {
+                link_components(static_cast<uint32_t>(u), v, comp.data());
+                ++d;
+                return d < neighbor_rounds;
+            }
+            return false;
+        });
+    }
+    compress_components(num_vertices, comp.data(), num_threads);
 
     uint32_t largest_component = sample_frequent_element(comp.data(), num_vertices);
     std::printf("[cc] sample+compress time=%.4f largest_component=%u\n",
                 seconds_since(sample_begin),
                 largest_component);
     auto final_begin = std::chrono::steady_clock::now();
-    parallel_for_ranges(num_vertices, num_threads, [&](size_t begin, size_t end, size_t tid) {
-        for (size_t u = begin; u < end; ++u) {
-            if (comp[u] == largest_component) {
-                continue;
-            }
-
-            size_t d = 0;
-            for_out_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
-                if (d > neighbor_rounds && v < num_vertices) {
-                    link_components(static_cast<uint32_t>(u), v, comp.data());
-                }
-                ++d;
-                return true;
-            });
-
-            d = 0;
-            for_in_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
-                if (d > neighbor_rounds && v < num_vertices) {
-                    link_components(static_cast<uint32_t>(u), v, comp.data());
-                }
-                ++d;
-                return true;
-            });
+    #pragma omp parallel for num_threads(threads) schedule(dynamic, 16384)
+    for (int64_t u = 0; u < static_cast<int64_t>(num_vertices); ++u) {
+        if (comp[static_cast<size_t>(u)] == largest_component) {
+            continue;
         }
-    });
-    compress_components(num_vertices, comp.data());
+
+        size_t d = 0;
+        size_t tid = static_cast<size_t>(omp_get_thread_num());
+        for_out_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
+            if (d > neighbor_rounds && v < num_vertices) {
+                link_components(static_cast<uint32_t>(u), v, comp.data());
+            }
+            ++d;
+            return true;
+        });
+
+        d = 0;
+        for_in_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
+            if (d > neighbor_rounds && v < num_vertices) {
+                link_components(static_cast<uint32_t>(u), v, comp.data());
+            }
+            ++d;
+            return true;
+        });
+    }
+    compress_components(num_vertices, comp.data(), num_threads);
     std::printf("[cc] final-link+compress time=%.4f\n", seconds_since(final_begin));
 
     size_t components = 0;
@@ -512,12 +499,16 @@ int main(int argc, char* argv[]) {
         if (opts.num_threads == 0) {
             throw std::runtime_error("--threads must be greater than 0");
         }
+        if (opts.algo_threads == 0) {
+            throw std::runtime_error("--algo-threads must be greater than 0");
+        }
 
         std::printf("[config] dataset=%s\n", opts.input_path.c_str());
         std::printf("[config] storage=%s\n", opts.storage_dir.c_str());
-        std::printf("[config] ingest_batch_edges=%zu threads=%zu bfs_rounds=%zu pr_iters=%zu pr_epsilon=%.6f cc_neighbor_rounds=%zu compact=%d\n",
+        std::printf("[config] ingest_batch_edges=%zu threads=%zu algo_threads=%zu bfs_rounds=%zu pr_iters=%zu pr_epsilon=%.6f cc_neighbor_rounds=%zu compact=%d\n",
                     opts.ingest_batch_edges,
                     opts.num_threads,
+                    opts.algo_threads,
                     opts.bfs_rounds,
                     opts.pr_iterations,
                     opts.pr_epsilon,
@@ -574,14 +565,35 @@ int main(int argc, char* argv[]) {
             auto batch_begin = std::chrono::steady_clock::now();
             size_t batch_edges = end - begin;
             size_t batch_threads = clamp_thread_count(opts.num_threads, batch_edges);
-            parallel_for_ranges(batch_edges, opts.num_threads, [&](size_t local_begin, size_t local_end, size_t) {
-                auto tx = db.BeginTransaction();
-                for (size_t i = begin + local_begin; i < begin + local_end; ++i) {
-                    const auto& edge = loaded.edges[i];
-                    tx.PutEdge(edge.src, edge.dst, edge_out_label, 1.0);
-                    tx.PutEdge(edge.dst, edge.src, edge_in_label, 1.0);
+            std::atomic<bool> ingest_failed(false);
+            std::exception_ptr ingest_exception;
+            std::mutex ingest_exception_mutex;
+            #pragma omp parallel num_threads(static_cast<int>(batch_threads))
+            {
+                if (ingest_failed.load(std::memory_order_relaxed)) {
+                    goto ingest_parallel_end;
                 }
-            });
+                try {
+                    auto tx = db.BeginTransaction();
+                    #pragma omp for schedule(static)
+                    for (int64_t i = static_cast<int64_t>(begin); i < static_cast<int64_t>(end); ++i) {
+                        const auto& edge = loaded.edges[static_cast<size_t>(i)];
+                        tx.PutEdge(edge.src, edge.dst, edge_out_label, 1.0);
+                        tx.PutEdge(edge.dst, edge.src, edge_in_label, 1.0);
+                    }
+                } catch (...) {
+                    ingest_failed.store(true, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lock(ingest_exception_mutex);
+                    if (!ingest_exception) {
+                        ingest_exception = std::current_exception();
+                    }
+                }
+ingest_parallel_end:
+                ;
+            }
+            if (ingest_exception) {
+                std::rethrow_exception(ingest_exception);
+            }
             ++batch_id;
             double elapsed = seconds_since(ts_ingest_begin);
             double pct = loaded.edges.empty()
@@ -608,6 +620,7 @@ int main(int argc, char* argv[]) {
             std::printf("[compact] done time=%.4f\n", seconds_since(compact_begin));
         }
         auto ts_ingest_end = std::chrono::steady_clock::now();
+        long rss_ingest = get_rss();
 
         double bfs_seconds = 0.0;
         size_t bfs_checksum = 0;
@@ -615,10 +628,17 @@ int main(int argc, char* argv[]) {
             uint32_t source = select_bfs_source(round, loaded.out_degree);
             auto t0 = std::chrono::steady_clock::now();
             std::printf("[bfs] round=%zu source=%u start\n", round, source);
-            auto bfs_out_tx = std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction());
-            auto bfs_in_tx = std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction());
-            auto with_out_neighbors = [&](size_t, uint32_t src, auto&& fn) {
-                auto edges = bfs_out_tx->GetEdges(src, edge_out_label);
+            size_t bfs_threads = clamp_thread_count(opts.algo_threads, loaded.num_vertices);
+            std::vector<std::shared_ptr<BACH::Transaction>> bfs_out_txs;
+            std::vector<std::shared_ptr<BACH::Transaction>> bfs_in_txs;
+            bfs_out_txs.reserve(bfs_threads);
+            bfs_in_txs.reserve(bfs_threads);
+            for (size_t tid = 0; tid < bfs_threads; ++tid) {
+                bfs_out_txs.push_back(std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction()));
+                bfs_in_txs.push_back(std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction()));
+            }
+            auto with_out_neighbors = [&](size_t tid, uint32_t src, auto&& fn) {
+                auto edges = bfs_out_txs[tid]->GetEdges(src, edge_out_label);
                 for (const auto& [dst, property] : *edges) {
                     (void)property;
                     if (!fn(dst)) {
@@ -626,8 +646,8 @@ int main(int argc, char* argv[]) {
                     }
                 }
             };
-            auto with_in_neighbors = [&](size_t, uint32_t dst, auto&& fn) {
-                auto edges = bfs_in_tx->GetEdges(dst, edge_in_label);
+            auto with_in_neighbors = [&](size_t tid, uint32_t dst, auto&& fn) {
+                auto edges = bfs_in_txs[tid]->GetEdges(dst, edge_in_label);
                 for (const auto& [src, property] : *edges) {
                     (void)property;
                     if (!fn(src)) {
@@ -636,7 +656,7 @@ int main(int argc, char* argv[]) {
                 }
             };
             size_t visited = run_gapbs_bfs(
-                loaded.num_vertices, source, opts.num_threads, with_out_neighbors, with_in_neighbors);
+                loaded.num_vertices, source, opts.algo_threads, with_out_neighbors, with_in_neighbors);
             bfs_checksum += visited;
             auto t1 = std::chrono::steady_clock::now();
             double round_seconds = std::chrono::duration<double>(t1 - t0).count();
@@ -647,12 +667,18 @@ int main(int argc, char* argv[]) {
                         visited,
                         round_seconds);
         }
+        long rss_bfs = get_rss();
 
         auto pr_t0 = std::chrono::steady_clock::now();
         std::printf("[pr] start iterations=%zu epsilon=%.6f\n", opts.pr_iterations, opts.pr_epsilon);
-        auto pr_in_tx = std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction());
-        auto with_in_neighbors = [&](size_t, uint32_t dst, auto&& fn) {
-            auto edges = pr_in_tx->GetEdges(dst, edge_in_label);
+        size_t pr_threads = clamp_thread_count(opts.algo_threads, loaded.num_vertices);
+        std::vector<std::shared_ptr<BACH::Transaction>> pr_in_txs;
+        pr_in_txs.reserve(pr_threads);
+        for (size_t tid = 0; tid < pr_threads; ++tid) {
+            pr_in_txs.push_back(std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction()));
+        }
+        auto with_in_neighbors = [&](size_t tid, uint32_t dst, auto&& fn) {
+            auto edges = pr_in_txs[tid]->GetEdges(dst, edge_in_label);
             for (const auto& [src, property] : *edges) {
                 (void)property;
                 if (!fn(src)) {
@@ -663,7 +689,7 @@ int main(int argc, char* argv[]) {
         double pr_sum = run_gapbs_pr(
             loaded.num_vertices,
             loaded.out_degree,
-            opts.num_threads,
+            opts.algo_threads,
             opts.pr_iterations,
             opts.pr_epsilon,
             with_in_neighbors);
@@ -673,10 +699,17 @@ int main(int argc, char* argv[]) {
 
         auto cc_t0 = std::chrono::steady_clock::now();
         std::printf("[cc] start neighbor_rounds=%zu\n", opts.cc_neighbor_rounds);
-        auto cc_out_tx = std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction());
-        auto cc_in_tx = std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction());
-        auto cc_with_out_neighbors = [&](size_t, uint32_t src, auto&& fn) {
-            auto edges = cc_out_tx->GetEdges(src, edge_out_label);
+        size_t cc_threads = clamp_thread_count(opts.algo_threads, loaded.num_vertices);
+        std::vector<std::shared_ptr<BACH::Transaction>> cc_out_txs;
+        std::vector<std::shared_ptr<BACH::Transaction>> cc_in_txs;
+        cc_out_txs.reserve(cc_threads);
+        cc_in_txs.reserve(cc_threads);
+        for (size_t tid = 0; tid < cc_threads; ++tid) {
+            cc_out_txs.push_back(std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction()));
+            cc_in_txs.push_back(std::make_shared<BACH::Transaction>(db.BeginReadOnlyTransaction()));
+        }
+        auto cc_with_out_neighbors = [&](size_t tid, uint32_t src, auto&& fn) {
+            auto edges = cc_out_txs[tid]->GetEdges(src, edge_out_label);
             for (const auto& [dst, property] : *edges) {
                 (void)property;
                 if (!fn(dst)) {
@@ -684,8 +717,8 @@ int main(int argc, char* argv[]) {
                 }
             }
         };
-        auto cc_with_in_neighbors = [&](size_t, uint32_t dst, auto&& fn) {
-            auto edges = cc_in_tx->GetEdges(dst, edge_in_label);
+        auto cc_with_in_neighbors = [&](size_t tid, uint32_t dst, auto&& fn) {
+            auto edges = cc_in_txs[tid]->GetEdges(dst, edge_in_label);
             for (const auto& [src, property] : *edges) {
                 (void)property;
                 if (!fn(src)) {
@@ -696,7 +729,7 @@ int main(int argc, char* argv[]) {
         size_t cc_components = run_gapbs_cc(
             loaded.num_vertices,
             opts.cc_neighbor_rounds,
-            opts.num_threads,
+            opts.algo_threads,
             cc_with_out_neighbors,
             cc_with_in_neighbors);
         auto cc_t1 = std::chrono::steady_clock::now();
@@ -710,20 +743,19 @@ int main(int argc, char* argv[]) {
         double ingest_bandwidth =
             ingest_seconds > 0.0 ? static_cast<double>(loaded.edges.size()) / ingest_seconds / 1e6 : 0.0;
 
-        std::printf(EXPOUT "Dataset: %s\n", opts.input_path.c_str());
-        std::printf(EXPOUT "StorageDir: %s\n", opts.storage_dir.c_str());
-        std::printf(EXPOUT "Vertex count: %u\n", loaded.num_vertices);
-        std::printf(EXPOUT "Edge count: %zu\n", loaded.edges.size());
         std::printf(EXPOUT "Load: %.4f\n", load_seconds);
         std::printf(EXPOUT "Ingest: %.4f\n", ingest_seconds);
         std::printf(EXPOUT "BFS: %.4f\n", bfs_seconds);
         std::printf(EXPOUT "PR: %.4f\n", pr_seconds);
         std::printf(EXPOUT "CC: %.4f\n", cc_seconds);
-        std::printf(EXPOUT "BFS_Checksum: %zu\n", bfs_checksum);
-        std::printf(EXPOUT "PR_Sum: %.8f\n", pr_sum);
-        std::printf(EXPOUT "CC_Components: %zu\n", cc_components);
-        std::printf(EXPOUT "Total: %.4f\n", total_seconds);
-        std::printf("Ingest bandwidth: %.4fM Edges/s\n", ingest_bandwidth);
+        std::printf(EXPOUT "RSS_Ingest: %ld\n", rss_ingest);
+        std::printf(EXPOUT "RSS_BFS: %ld\n", rss_bfs);
+        std::printf("[result] bfs_checksum=%zu pr_sum=%.8f cc_components=%zu total=%.4f ingest_bw=%.4fM edges/s\n",
+                    bfs_checksum,
+                    pr_sum,
+                    cc_components,
+                    total_seconds,
+                    ingest_bandwidth);
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
