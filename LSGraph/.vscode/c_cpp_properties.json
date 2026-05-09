@@ -1,0 +1,16 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "defines": ["CILK=1"],
+            "compilerPath": "/home/ldeng/open-source/OpenCilk_v1.0/OpenCilk-10.0.1-Linux/bin/clang++",
+            "intelliSenseMode": "linux-clang-x64",
+            "configurationProvider": "ms-vscode.cpptools",
+            "cppStandard": "c++17"
+        }
+    ],
+    "version": 4
+}

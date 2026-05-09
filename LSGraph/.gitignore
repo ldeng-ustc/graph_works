@@ -1,0 +1,7 @@
+/LSGraph
+/LSGraph-Bench
+/LSGraph-TC
+/LSGraph-Ingestion
+
+/obj/*
+/opencilk/
