@@ -297,7 +297,51 @@ inline uint32_t sample_frequent_element(uint32_t* comp,
         sample_counts.begin(),
         sample_counts.end(),
         [](const auto& a, const auto& b) { return a.second < b.second; });
+    const float frac_of_graph =
+        static_cast<float>(most_frequent->second) / static_cast<float>(num_samples);
+    std::printf("[cc] skipping largest intermediate component id=%u approx=%.2f%%\n",
+                most_frequent->first,
+                frac_of_graph * 100.0f);
     return most_frequent->first;
+}
+
+template <typename KeyT, typename ValT>
+inline std::vector<std::pair<ValT, KeyT>> top_k_components(
+    const std::vector<std::pair<KeyT, ValT>>& to_sort, size_t k) {
+    std::vector<std::pair<ValT, KeyT>> top_k;
+    ValT min_so_far = 0;
+    for (const auto& kvp : to_sort) {
+        if ((top_k.size() < k) || (kvp.second > min_so_far)) {
+            top_k.push_back(std::make_pair(kvp.second, kvp.first));
+            std::sort(top_k.begin(), top_k.end(), std::greater<std::pair<ValT, KeyT>>());
+            if (top_k.size() > k) {
+                top_k.resize(k);
+            }
+            min_so_far = top_k.back().first;
+        }
+    }
+    return top_k;
+}
+
+inline void print_component_stats(const uint32_t* comp, uint32_t num_vertices) {
+    std::unordered_map<uint32_t, uint32_t> count;
+    for (uint32_t i = 0; i < num_vertices; ++i) {
+        count[comp[i]] += 1;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> count_vector;
+    count_vector.reserve(count.size());
+    for (const auto& kvp : count) {
+        count_vector.push_back(kvp);
+    }
+
+    int k = std::min<int>(5, static_cast<int>(count_vector.size()));
+    const auto top_k = top_k_components(count_vector, static_cast<size_t>(k));
+    std::printf("[cc] %d biggest clusters\n", k);
+    for (const auto& kvp : top_k) {
+        std::printf("[cc] %u:%u\n", kvp.second, kvp.first);
+    }
+    std::printf("[cc] components=%zu\n", count.size());
 }
 
 template <typename ForOutNeighbors, typename ForInNeighbors>
@@ -365,6 +409,7 @@ size_t run_gapbs_cc(uint32_t num_vertices,
     }
     compress_components(num_vertices, comp.data(), num_threads);
     std::printf("[cc] final-link+compress time=%.4f\n", seconds_since(final_begin));
+    print_component_stats(comp.data(), num_vertices);
 
     size_t components = 0;
     for (uint32_t v = 0; v < num_vertices; ++v) {

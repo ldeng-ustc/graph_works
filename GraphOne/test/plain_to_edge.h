@@ -552,7 +552,7 @@ void plaingraph_manager_t<T>::run_cc()
 {
     pgraph_t<T>* pgraph = (pgraph_t<T>*)get_plaingraph();
     snap_t<T>* snaph = create_static_view(pgraph, STALE_MASK|V_CENTRIC);
-    cc_gapbs<T>(snaph, 2, false);
+    cc_gapbs<T>(snaph, 2, true);
     delete_static_view(snaph);
 }
 
