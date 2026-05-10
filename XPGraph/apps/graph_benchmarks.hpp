@@ -226,14 +226,18 @@ void test_graph_benchmarks_numa(XPGraph* xpgraph){
 
 void test_graph_benchmarks_gapbs(XPGraph* xpgraph){
     auto st = mywtime();
-    
-    test_bfs_numa(xpgraph, 1);
+
+    for(size_t i = 0; i < 20; i++) {
+        test_bfs_numa(xpgraph, i);
+    }
     auto ts1 = mywtime();
 
     test_pagerank_pull_numa(xpgraph, 10);
     auto ts2 = mywtime();
 
-    test_connected_components_numa(xpgraph, 2);
+    for(size_t i = 0; i < 10; i++) {
+        test_connected_components_numa(xpgraph, 2);
+    }
     auto ts3 = mywtime();
     
     auto t_bfs = ts1 - st;
@@ -244,6 +248,5 @@ void test_graph_benchmarks_gapbs(XPGraph* xpgraph){
     printf(EXPOUT "PR: %.3fs\n", t_pr);
     printf(EXPOUT "CC: %.3fs\n", t_cc);
 }
-
 
 
