@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <dirent.h>
 #include <assert.h>
@@ -766,5 +767,71 @@ void dump_simple()
     neighbours = nullptr; 
     neighbours_sz = 0;
 
+    delete_static_view(view);
+}
+
+template <class T>
+void debug_vertex_neighbors(vid_t v_count, const string& idir, const string& odir, sid_t vertex_id)
+{
+    plaingraph_manager_t<T> manager;
+    manager.schema(_dir);
+    manager.setup_graph(v_count);
+    manager.prep_graph2(idir, odir);
+
+    pgraph_t<T>* pgraph = manager.get_plaingraph();
+    auto view = create_static_view(pgraph, SIMPLE_MASK);
+    if (vertex_id >= view->get_vcount()) {
+        cout << "[debug] vertex " << vertex_id << " is out of range, vcount="
+             << view->get_vcount() << endl;
+        delete_static_view(view);
+        return;
+    }
+
+    T* neighbours = nullptr;
+    uint64_t neighbours_sz = 0;
+    auto ensure_capacity = [&](uint64_t degree) {
+        if (degree > neighbours_sz) {
+            neighbours_sz = degree;
+            neighbours = (T*) realloc(neighbours, sizeof(neighbours[0]) * degree);
+        }
+    };
+    auto print_neighbours = [&](const char* name, uint64_t degree, bool incoming) {
+        ensure_capacity(degree);
+        vector<sid_t> raw;
+        raw.reserve(degree);
+        if (degree > 0) {
+            if (incoming) {
+                view->get_nebrs_in(vertex_id, neighbours);
+            } else {
+                view->get_nebrs_out(vertex_id, neighbours);
+            }
+            for (uint64_t edge_id = 0; edge_id < degree; edge_id++) {
+                raw.push_back(get_sid(neighbours[edge_id]));
+            }
+        }
+        vector<sid_t> sorted = raw;
+        sort(sorted.begin(), sorted.end());
+        cout << "[debug] vertex=" << vertex_id << " " << name << "_count=" << raw.size()
+             << " raw=";
+        for (size_t i = 0; i < raw.size(); ++i) {
+            if (i > 0) cout << ",";
+            cout << raw[i];
+        }
+        cout << endl;
+        cout << "[debug] vertex=" << vertex_id << " " << name << "_sorted=";
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            if (i > 0) cout << ",";
+            cout << sorted[i];
+        }
+        cout << endl;
+    };
+
+    cout << "[debug] vertex=" << vertex_id
+         << " out_degree=" << view->get_degree_out(vertex_id)
+         << " in_degree=" << view->get_degree_in(vertex_id) << endl;
+    print_neighbours("out_neighbors", view->get_degree_out(vertex_id), false);
+    print_neighbours("in_neighbors", view->get_degree_in(vertex_id), true);
+
+    free(neighbours);
     delete_static_view(view);
 }

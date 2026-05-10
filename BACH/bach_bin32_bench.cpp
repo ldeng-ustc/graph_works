@@ -44,6 +44,7 @@ struct Options {
     size_t bfs_rounds = 20;
     size_t cc_rounds = 10;
     size_t cc_neighbor_rounds = 2;
+    int64_t debug_vertex = -1;
     bool reset = false;
     bool compact = false;
 };
@@ -82,6 +83,7 @@ void print_usage(const char* argv0) {
         << "  --bfs-rounds <n>      BFS rounds, default 20\n"
         << "  --cc-rounds <n>       CC rounds, default 10\n"
         << "  --cc-neighbor-rounds <n>  CC sampled neighbor rounds, default 2\n"
+        << "  --debug-vertex <id>   Print out/in neighbors for one vertex and exit after ingest\n"
         << "  --compact             Run DB::CompactAll() after ingest\n"
         << "  --reset               Remove existing storage dir before ingest\n";
 }
@@ -117,6 +119,8 @@ Options parse_args(int argc, char* argv[]) {
             opts.cc_rounds = std::stoull(require_value("--cc-rounds"));
         } else if (arg == "--cc-neighbor-rounds") {
             opts.cc_neighbor_rounds = std::stoull(require_value("--cc-neighbor-rounds"));
+        } else if (arg == "--debug-vertex") {
+            opts.debug_vertex = std::stoll(require_value("--debug-vertex"));
         } else if (arg == "--reset") {
             opts.reset = true;
         } else if (arg == "--compact") {
@@ -147,6 +151,9 @@ void validate_options(const Options& opts) {
     }
     if (opts.algo_threads == 0) {
         throw std::runtime_error("--algo-threads must be greater than 0");
+    }
+    if (opts.debug_vertex < -1) {
+        throw std::runtime_error("--debug-vertex must be >= 0");
     }
 }
 
@@ -375,6 +382,55 @@ void print_summary(double load_seconds,
                 ingest_bandwidth);
 }
 
+void print_vertex_neighbors(BACH::DB& db,
+                            BACHBenchmarkLabels labels,
+                            const LoadedGraph& loaded,
+                            uint32_t vertex_id) {
+    if (vertex_id >= loaded.num_vertices) {
+        throw std::runtime_error("debug vertex is out of range");
+    }
+
+    auto print_list = [&](const char* name, const std::vector<uint32_t>& values) {
+        std::vector<uint32_t> sorted = values;
+        std::sort(sorted.begin(), sorted.end());
+        std::printf("[debug] vertex=%u %s_count=%zu raw=", vertex_id, name, values.size());
+        for (size_t i = 0; i < values.size(); ++i) {
+            std::printf("%s%u", i == 0 ? "" : ",", values[i]);
+        }
+        std::printf("\n");
+        std::printf("[debug] vertex=%u %s_sorted=", vertex_id, name);
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            std::printf("%s%u", i == 0 ? "" : ",", sorted[i]);
+        }
+        std::printf("\n");
+    };
+
+    auto tx = db.BeginReadOnlyTransaction();
+    std::vector<uint32_t> out_neighbors;
+    std::vector<uint32_t> in_neighbors;
+
+    auto out_edges = tx.GetEdges(vertex_id, labels.edge_out_label);
+    out_neighbors.reserve(out_edges->size());
+    for (const auto& [dst, property] : *out_edges) {
+        (void)property;
+        out_neighbors.push_back(dst);
+    }
+
+    auto in_edges = tx.GetEdges(vertex_id, labels.edge_in_label);
+    in_neighbors.reserve(in_edges->size());
+    for (const auto& [src, property] : *in_edges) {
+        (void)property;
+        in_neighbors.push_back(src);
+    }
+
+    std::printf("[debug] vertex=%u loaded_out_degree=%u loaded_in_degree=%u\n",
+                vertex_id,
+                loaded.out_degree[vertex_id],
+                loaded.in_degree[vertex_id]);
+    print_list("out_neighbors", out_neighbors);
+    print_list("in_neighbors", in_neighbors);
+}
+
 int main(int argc, char* argv[]) {
     try {
         const auto bench_begin = std::chrono::steady_clock::now();
@@ -403,6 +459,14 @@ int main(int argc, char* argv[]) {
         maybe_compact(*handles.db, opts.compact);
         const double ingest_seconds = seconds_since(ingest_begin);
         const long rss_ingest = get_rss();
+
+        if (opts.debug_vertex >= 0) {
+            print_vertex_neighbors(*handles.db,
+                                   handles.benchmark_labels(),
+                                   loaded,
+                                   static_cast<uint32_t>(opts.debug_vertex));
+            return 0;
+        }
 
         const BACHBenchmarkResult result = run_bach_graph_benchmarks_gapbs(
             *handles.db, handles.benchmark_labels(), loaded, make_benchmark_config(opts));

@@ -1335,6 +1335,9 @@ void plain_test(vid_t v_count1, const string& idir, const string& odir, int job)
         case 99:
             basic_benchmark<dst_id_t>(v_count1, idir, odir);
             break;
+        case 100:
+            debug_vertex_neighbors<dst_id_t>(v_count1, idir, odir, static_cast<sid_t>(residue));
+            break;
         //plaingrah benchmark testing    
         case 0: 
             test_ingestion<dst_id_t>(idir, odir);
