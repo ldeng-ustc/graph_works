@@ -1,0 +1,18 @@
+BasedOnStyle: Google
+DerivePointerAlignment: false
+PointerAlignment: Right
+ColumnLimit: 120
+
+IncludeBlocks: Preserve
+AlignTrailingComments: true  
+AlignConsecutiveDeclarations: true
+AlignConsecutiveAssignments: true
+BreakBeforeBinaryOperators: NonAssignment
+
+PackConstructorInitializers: Never
+BreakConstructorInitializers: BeforeComma
+
+# Marcos
+AlignConsecutiveMacros: true
+AlignEscapedNewlines: Left    
+AllowShortFunctionsOnASingleLine: Empty 

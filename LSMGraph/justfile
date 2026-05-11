@@ -1,0 +1,8 @@
+test-deps:
+    which clang-format >/dev/null || (echo "clang-format not found. Please install it." && exit 1)
+
+format:
+    find src -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.cpp" -o -name "*.cc"  \) -exec clang-format -i {} +
+
+check-format:
+    find src -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.cpp" -o -name "*.cc"  \) -exec clang-format --dry-run --Werror {} +

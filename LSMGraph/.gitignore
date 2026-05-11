@@ -1,0 +1,8 @@
+.direnv
+.trunk
+.cache
+.vscode
+build
+clangd_trace.json
+test**
+*.log
