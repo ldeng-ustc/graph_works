@@ -1,0 +1,1263 @@
+#include <algorithm>
+
+#include "rocksdb/graph.h"
+#include "rocksdb/write_batch.h"
+
+namespace ROCKSDB_NAMESPACE {
+
+void inline MergeSortOutEdges(const Edges& existing_edges,
+                              const Edges& new_edges, Edges& merged_edges,
+                              node_id_t vertex, node_id_t& m,
+                              bool is_partial = true,
+                              MorrisCounter* mor = NULL) {
+  std::vector<node_id_t> delete_edges;
+  node_id_t pivot_ex = 0;
+  node_id_t pivot_new = 0;
+  uint32_t edge_count = 0;
+  // sorted_merge
+  auto merge_edges_list = new Edge[merged_edges.num_edges_out];
+  while (pivot_ex < existing_edges.num_edges_out ||
+         pivot_new < new_edges.num_edges_out) {
+    bool is_deleted = false;
+    if(pivot_ex < existing_edges.num_edges_out){
+      for (auto delete_edge : delete_edges) {
+        if (delete_edge == existing_edges.nxts_out[pivot_ex].nxt) {
+          pivot_ex++;
+          is_deleted = true;
+          mor->DecayCounter(vertex);
+          m--;
+        }
+      }
+    }
+    if (is_deleted) continue;
+    if (pivot_ex >= existing_edges.num_edges_out) {
+      merge_edges_list[edge_count++].nxt = new_edges.nxts_out[pivot_new++].nxt;
+      continue;
+    }
+    if (pivot_new >= new_edges.num_edges_out) {
+      merge_edges_list[edge_count++].nxt =
+          existing_edges.nxts_out[pivot_ex++].nxt;
+      continue;
+    }
+    if (existing_edges.nxts_out[pivot_ex].nxt < 0) {
+      //delete_edges.push_back(-existing_edges.nxts_out[pivot_ex].nxt);
+      if(!is_partial){
+        pivot_ex++;
+        continue;
+      }
+    }
+    if (new_edges.nxts_out[pivot_new].nxt < 0) {
+      delete_edges.push_back((-new_edges.nxts_out[pivot_new].nxt) - 1);
+      if(!is_partial){
+        pivot_new++;
+        continue;
+      }
+    }
+    if (existing_edges.nxts_out[pivot_ex].nxt ==
+        new_edges.nxts_out[pivot_new].nxt) {
+      pivot_ex++;
+      mor->DecayCounter(vertex);
+      m--;
+    } else if (existing_edges.nxts_out[pivot_ex].nxt >
+               new_edges.nxts_out[pivot_new].nxt) {
+      merge_edges_list[edge_count++].nxt = new_edges.nxts_out[pivot_new++].nxt;
+    } else {
+      merge_edges_list[edge_count++].nxt =
+          existing_edges.nxts_out[pivot_ex++].nxt;
+    }
+  }
+  merged_edges.num_edges_out = edge_count;
+  merged_edges.nxts_out = merge_edges_list;
+}
+
+void inline MergeSortInEdges(const Edges& existing_edges,
+                             const Edges& new_edges, Edges& merged_edges,
+                             node_id_t vertex, bool is_partial = true,
+                             MorrisCounter* mor = NULL) {
+  std::vector<node_id_t> delete_edges;
+  node_id_t pivot_ex = 0;
+  node_id_t pivot_new = 0;
+  uint32_t edge_count = 0;
+  // sorted_merge
+  auto merge_edges_list = new Edge[merged_edges.num_edges_in];
+  while (pivot_ex < existing_edges.num_edges_in ||
+         pivot_new < new_edges.num_edges_in) {
+    bool is_deleted = false;
+    if(pivot_ex < existing_edges.num_edges_in){
+      for (auto delete_edge : delete_edges) {
+        if (delete_edge == existing_edges.nxts_in[pivot_ex].nxt) {
+          pivot_ex++;
+          is_deleted = true;
+          mor->DecayCounter(vertex);
+        }
+      }
+    }
+    if (is_deleted) continue;
+    if (pivot_ex >= existing_edges.num_edges_in) {
+      merge_edges_list[edge_count++].nxt = new_edges.nxts_in[pivot_new++].nxt;
+      continue;
+    }
+    if (pivot_new >= new_edges.num_edges_in) {
+      merge_edges_list[edge_count++].nxt =
+          existing_edges.nxts_in[pivot_ex++].nxt;
+      continue;
+    }
+    if (existing_edges.nxts_in[pivot_ex].nxt < 0) {
+      //delete_edges.push_back(-existing_edges.nxts_in[pivot_ex].nxt);
+      if(!is_partial){
+        pivot_ex++;
+        continue;
+      }
+    }
+    if (new_edges.nxts_in[pivot_new].nxt < 0) {
+      delete_edges.push_back((-new_edges.nxts_in[pivot_new].nxt) - 1);
+      if(!is_partial){
+        pivot_new++;
+        continue;
+      }
+    }
+    if (existing_edges.nxts_in[pivot_ex].nxt ==
+        new_edges.nxts_in[pivot_new].nxt) {
+      pivot_ex++;
+      mor->DecayCounter(vertex);
+    } else if (existing_edges.nxts_in[pivot_ex].nxt >
+               new_edges.nxts_in[pivot_new].nxt) {
+      merge_edges_list[edge_count++].nxt = new_edges.nxts_in[pivot_new++].nxt;
+    } else {
+      merge_edges_list[edge_count++].nxt =
+          existing_edges.nxts_in[pivot_ex++].nxt;
+    }
+  }
+  merged_edges.num_edges_in = edge_count;
+  merged_edges.nxts_in = merge_edges_list;
+}
+
+bool RocksGraph::AdjacentListMergeOp::Merge(const Slice& key,
+                                            const Slice* existing_value,
+                                            const Slice& value,
+                                            std::string* new_value,
+                                            Logger* logger) const {
+  if (key.size()) {
+    if (!existing_value) {
+      *new_value = value.ToString();
+      return true;
+    }
+  }
+  Edges new_edges, existing_edges, merged_edges;
+  decode_edges(&new_edges, value.data(), value.size(), encoding_type_);
+  decode_edges(&existing_edges, existing_value->data(), existing_value->size(), encoding_type_);
+  merged_edges.num_edges_out =
+      existing_edges.num_edges_out + new_edges.num_edges_out;
+  merged_edges.num_edges_in =
+      existing_edges.num_edges_in + new_edges.num_edges_in;
+  MergeSortOutEdges(existing_edges, new_edges, merged_edges,
+                    decode_node(key.data()), *m_, false, morris_);
+  MergeSortInEdges(existing_edges, new_edges, merged_edges,
+                   decode_node(key.data()), false, morris_);
+  free_edges(&existing_edges);
+  free_edges(&new_edges);
+  encode_edges(&merged_edges, new_value, encoding_type_);
+  free_edges(&merged_edges);
+  return true;
+  logger->Flush();
+}
+
+bool RocksGraph::AdjacentListMergeOp::PartialMerge(const Slice& key,
+                                                   const Slice& existing_value,
+                                                   const Slice& value,
+                                                   std::string* new_value,
+                                                   Logger* logger) const {
+  // printf("Partial Merging\n");
+  if (key.size()) {
+    if (!existing_value.size()) {
+      *new_value = value.ToString();
+      return true;
+    }
+  }
+  Edges new_edges, existing_edges, merged_edges;
+  decode_edges(&new_edges, value.data(), value.size(), encoding_type_);
+  decode_edges(&existing_edges, existing_value.data(), existing_value.size(), encoding_type_);
+  merged_edges.num_edges_out =
+      existing_edges.num_edges_out + new_edges.num_edges_out;
+  merged_edges.num_edges_in =
+      existing_edges.num_edges_in + new_edges.num_edges_in;
+  MergeSortOutEdges(existing_edges, new_edges, merged_edges,
+                    decode_node(key.data()), *m_, true, morris_);
+  MergeSortInEdges(existing_edges, new_edges, merged_edges,
+                   decode_node(key.data()), true, morris_);
+  free_edges(&existing_edges);
+  free_edges(&new_edges);
+  encode_edges(&merged_edges, new_value, encoding_type_);
+  free_edges(&merged_edges);
+  return true;
+  logger->Flush();
+}
+
+void inline write_property(node_id_t& id, std::string* output,
+                           std::string::iterator& it, std::string& str) {
+  encode_node(id, output);
+  std::vector<Property> props;
+  decode_properties(it, props);
+  concatenate_properties(props, output);
+  if (it < str.end()) id = decode_id(it);
+}
+
+bool RocksGraph::PropertyMergeOp::Merge(const Slice& key,
+                                        const Slice* existing_value,
+                                        const Slice& value,
+                                        std::string* new_value,
+                                        Logger* logger) const {
+  std::string existing_str = existing_value->ToString();
+  std::string new_str = value.ToString();
+  std::string::iterator existing_it = existing_str.begin();
+  std::string::iterator new_it = new_str.begin();
+  node_id_t existing_id = decode_id(existing_it);
+  node_id_t new_id = decode_id(new_it);
+  while (existing_it < existing_str.end() || new_it < new_str.end()) {
+    if (existing_it >= existing_str.end()) {
+      write_property(new_id, new_value, new_it, new_str);
+      continue;
+    }
+    if (new_it >= new_str.end()) {
+      write_property(existing_id, new_value, existing_it, existing_str);
+      continue;
+    }
+    if (existing_id == new_id) {
+      encode_node(existing_id, new_value);
+      std::vector<Property> existing_props, new_props, merged_props;
+      decode_properties(existing_it, existing_props);
+      decode_properties(new_it, new_props);
+      merge_properties(existing_props, new_props, merged_props);
+      concatenate_properties(merged_props, new_value);
+      if (new_it < new_str.end()) {
+        new_id = decode_id(new_it);
+      }
+      if (existing_it < existing_str.end()) {
+        existing_id = decode_id(existing_it);
+      }
+    } else if (existing_id > new_id) {
+      write_property(new_id, new_value, new_it, new_str);
+    } else if (existing_id < new_id) {
+      write_property(existing_id, new_value, existing_it, existing_str);
+    }
+  }
+  if (key.size()) logger->Flush();
+  return true;
+}
+
+bool RocksGraph::PropertyMergeOp::PartialMerge(const Slice& key,
+                                               const Slice& existing_value,
+                                               const Slice& value,
+                                               std::string* new_value,
+                                               Logger* logger) const {
+  std::string existing_str = existing_value.ToString();
+  std::string new_str = value.ToString();
+  std::string::iterator existing_it = existing_str.begin();
+  std::string::iterator new_it = new_str.begin();
+  node_id_t existing_id = decode_id(existing_it);
+  node_id_t new_id = decode_id(new_it);
+  while (existing_it < existing_str.end() || new_it < new_str.end()) {
+    if (existing_it >= existing_str.end()) {
+      write_property(new_id, new_value, new_it, new_str);
+      continue;
+    }
+    if (new_it >= new_str.end()) {
+      write_property(existing_id, new_value, existing_it, existing_str);
+      continue;
+    }
+    if (existing_id == new_id) {
+      encode_node(existing_id, new_value);
+      std::vector<Property> existing_props, new_props, merged_props;
+      decode_properties(existing_it, existing_props);
+      decode_properties(new_it, new_props);
+      merge_properties(existing_props, new_props, merged_props);
+      concatenate_properties(merged_props, new_value);
+      if (new_it < new_str.end()) {
+        new_id = decode_id(new_it);
+      }
+      if (existing_it < existing_str.end()) {
+        existing_id = decode_id(existing_it);
+      }
+    } else if (existing_id > new_id) {
+      write_property(new_id, new_value, new_it, new_str);
+    } else if (existing_id < new_id) {
+      write_property(existing_id, new_value, existing_it, existing_str);
+    }
+  }
+  if (key.size()) logger->Flush();
+  return true;
+}
+
+bool inline InsertToEdgeList(Edge*& new_list, const Edge* cur_list,
+                             node_id_t cur_length, node_id_t insert_id) {
+  new_list = new Edge[cur_length + 1];
+  node_id_t pivot_ex = 0;
+  uint32_t edge_count = 0;
+  bool is_merge = false;
+  while (pivot_ex < cur_length) {
+    if (edge_count == pivot_ex) {
+      if (cur_list[pivot_ex].nxt == insert_id) is_merge = true;
+      if (cur_list[pivot_ex].nxt > insert_id && !is_merge) {
+        new_list[edge_count++].nxt = insert_id;
+      } else {
+        new_list[edge_count++].nxt = cur_list[pivot_ex++].nxt;
+      }
+    } else {
+      new_list[edge_count++].nxt = cur_list[pivot_ex++].nxt;
+    }
+  }
+  if (cur_length == 0 || cur_list[cur_length - 1].nxt < insert_id) {
+    new_list[cur_length].nxt = insert_id;
+  }
+  return is_merge;
+}
+
+node_id_t RocksGraph::random_walk(node_id_t start, float decay_factor) {
+  node_id_t cur = start;
+  for (;;) {
+    Edges edges;
+    std::string key;
+    std::string value;
+    encode_node(VertexKey{.id = cur}, &key);
+    Status s = db_->Get(ReadOptions(), adj_cf_, key, &value);
+    if (!s.ok()) {
+      return 0;
+    }
+    decode_edges(&edges, value, encoding_type_);
+    if (edges.num_edges_out == 0) {
+      free_edges(&edges);
+      return cur;
+    }
+    float r = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+    if (r < decay_factor) {
+      free_edges(&edges);
+      return cur;
+    }
+    int idx = rand() % edges.num_edges_out;
+    cur = edges.nxts_out[idx].nxt;
+    free_edges(&edges);
+  }
+}
+
+node_id_t RocksGraph::CountVertex() { return n; }
+
+node_id_t RocksGraph::CountEdge() { return m; }
+
+Status RocksGraph::AddVertex(node_id_t id) {
+  n++;
+  VertexKey v{.id = id};
+  std::string key, value;
+  encode_node(v, &key);
+  Edges edges{.num_edges_out = 0, .num_edges_in = 0};
+  edges.nxts_out = NULL;
+  edges.nxts_in = NULL;
+  encode_edges(&edges, &value, encoding_type_);
+  free_edges(&edges);
+  // if (edge_update_policy_ == EDGE_UPDATE_FULL_LAZY)
+  //   return db_->Merge(WriteOptions(), adj_cf_, key, value);
+  db_->Put(WriteOptions(), adj_cf_, key, value);
+  value = "";
+  db_->Put(WriteOptions(), edge_prop_cf_, key, value);
+  db_->Put(WriteOptions(), vertex_prop_cf_, key, value);
+  return Status::OK();
+}
+
+Status RocksGraph::AddEdge(node_id_t from, node_id_t to) {
+  // if (filter_type_ == FILTER_TYPE_CMS || FILTER_TYPE_ALL) {
+  //   cms_out.UpdateSketch(from);
+  //   cms_in.UpdateSketch(to);
+  // }
+  // if (filter_type_ == FILTER_TYPE_MORRIS || FILTER_TYPE_ALL) {
+  //   mor_out.AddCounter(from);
+  //   mor_in.AddCounter(to);
+  // }
+
+  Status s;
+  m++;
+  WriteBatch batch;
+  bool in_edge_handled = false;
+
+  // we insert vertex 'to' into the out edge list of vertex 'from' at first
+  // VertexKey v_out{.id = from, .type = KEY_TYPE_ADJENCENT_LIST};
+  VertexKey v_out{.id = from};
+  std::string key_out, value_out;
+  encode_node(v_out, &key_out);
+  int out_policy = edge_update_policy_;
+  if (out_policy == EDGE_UPDATE_FULL_LAZY) {
+    encode_node_hash(v_out, to, &key_out);
+  }
+  if (out_policy == EDGE_UPDATE_ADAPTIVE) {
+    out_policy = AdaptPolicy(from, update_ratio_, lookup_ratio_);
+  }
+  if (out_policy == EDGE_UPDATE_LAZY || out_policy == EDGE_UPDATE_FULL_LAZY) {
+    mor.AddCounter(from);
+    Edges edges{.num_edges_out = 1, .num_edges_in = 0};
+    edges.nxts_out = new Edge[1];
+    edges.nxts_out[0] = Edge{.nxt = to};
+    encode_edges(&edges, &value_out, encoding_type_);
+    free_edges(&edges);
+    batch.Merge(adj_cf_, key_out, value_out);
+  } else if (out_policy == EDGE_UPDATE_EAGER) {
+    Edges existing_edges{.num_edges_out = 0, .num_edges_in = 0};
+    s = GetAllEdges(from, &existing_edges);
+    if (!s.ok() && !s.IsNotFound()) {
+      return s;
+    }
+    Edges new_edges{.num_edges_out = existing_edges.num_edges_out + 1,
+                    .num_edges_in = existing_edges.num_edges_in};
+    // copy existing in edges
+    new_edges.nxts_in = new Edge[existing_edges.num_edges_in];
+    memcpy(new_edges.nxts_in, existing_edges.nxts_in,
+           existing_edges.num_edges_in * sizeof(Edge));
+    // insert new out neighbor by order
+    bool is_merge =
+        InsertToEdgeList(new_edges.nxts_out, existing_edges.nxts_out,
+                         existing_edges.num_edges_out, to);
+    if (is_merge)
+      new_edges.num_edges_out--;
+    else
+      mor.AddCounter(from);
+    if (is_merge) m--;
+    // For self-loops, also insert the in-edge in the same write
+    if (from == to) {
+      in_edge_handled = true;
+      Edges combined{.num_edges_out = new_edges.num_edges_out,
+                     .num_edges_in = new_edges.num_edges_in + 1};
+      combined.nxts_out = new_edges.nxts_out;
+      bool is_merge_in =
+          InsertToEdgeList(combined.nxts_in, new_edges.nxts_in,
+                           new_edges.num_edges_in, from);
+      if (is_merge_in)
+        combined.num_edges_in--;
+      else
+        mor.AddCounter(to);
+      std::string new_value;
+      encode_edges(&combined, &new_value, encoding_type_);
+      free_edges(&existing_edges);
+      // Free only nxts_in from new_edges (nxts_out moved to combined)
+      delete[] new_edges.nxts_in;
+      free_edges(&combined);
+      batch.Put(adj_cf_, key_out, new_value);
+    } else {
+      std::string new_value;
+      encode_edges(&new_edges, &new_value, encoding_type_);
+      free_edges(&existing_edges);
+      free_edges(&new_edges);
+      batch.Put(adj_cf_, key_out, new_value);
+    }
+  }
+
+  if (!in_edge_handled) {
+    VertexKey v_in{.id = to};
+    std::string key_in, value_in;
+    encode_node(v_in, &key_in);
+    int in_policy = edge_update_policy_;
+    if (in_policy == EDGE_UPDATE_FULL_LAZY) {
+      encode_node_hash(v_in, from, &key_in);
+    }
+    if (in_policy == EDGE_UPDATE_ADAPTIVE) {
+      in_policy = AdaptPolicy(from, update_ratio_, lookup_ratio_);
+    }
+    if (in_policy == EDGE_UPDATE_LAZY || in_policy == EDGE_UPDATE_FULL_LAZY) {
+      mor.AddCounter(to);
+      Edges edges{.num_edges_out = 0, .num_edges_in = 1};
+      edges.nxts_in = new Edge[1];
+      edges.nxts_in[0] = Edge{.nxt = from};
+      encode_edges(&edges, &value_in, encoding_type_);
+      free_edges(&edges);
+      batch.Merge(adj_cf_, key_in, value_in);
+    } else if (in_policy == EDGE_UPDATE_EAGER) {
+      Edges existing_edges{.num_edges_out = 0, .num_edges_in = 0};
+      s = GetAllEdges(to, &existing_edges);
+      if (!s.ok() && !s.IsNotFound()) {
+        return s;
+      }
+      Edges new_edges{.num_edges_out = existing_edges.num_edges_out,
+                      .num_edges_in = existing_edges.num_edges_in + 1};
+      // copy existing out edges
+      new_edges.nxts_out = new Edge[existing_edges.num_edges_out];
+      memcpy(new_edges.nxts_out, existing_edges.nxts_out,
+             existing_edges.num_edges_out * sizeof(Edge));
+      bool is_merge = InsertToEdgeList(new_edges.nxts_in, existing_edges.nxts_in,
+                                       existing_edges.num_edges_in, from);
+      if (is_merge)
+        new_edges.num_edges_in--;
+      else
+        mor.AddCounter(to);
+      std::string new_value;
+      encode_edges(&new_edges, &new_value, encoding_type_);
+      free_edges(&existing_edges);
+      free_edges(&new_edges);
+      batch.Put(adj_cf_, key_in, new_value);
+    }
+  }
+  return db_->Write(WriteOptions(), &batch);
+}
+
+Status RocksGraph::AddEdgeLazy(node_id_t from, node_id_t to) {
+  m++;
+  WriteBatch batch;
+
+  // Forward edge: add 'to' to out-edge list of 'from'
+  {
+    VertexKey v{.id = from};
+    std::string key, value;
+    encode_node(v, &key);
+    mor.AddCounter(from);
+    Edges edges{.num_edges_out = 1, .num_edges_in = 0};
+    edges.nxts_out = new Edge[1];
+    edges.nxts_out[0] = Edge{.nxt = to};
+    encode_edges(&edges, &value, encoding_type_);
+    free_edges(&edges);
+    batch.Merge(adj_cf_, key, value);
+  }
+
+  // Reverse edge: add 'from' to in-edge list of 'to'
+  {
+    VertexKey v{.id = to};
+    std::string key, value;
+    encode_node(v, &key);
+    mor.AddCounter(to);
+    Edges edges{.num_edges_out = 0, .num_edges_in = 1};
+    edges.nxts_in = new Edge[1];
+    edges.nxts_in[0] = Edge{.nxt = from};
+    encode_edges(&edges, &value, encoding_type_);
+    free_edges(&edges);
+    batch.Merge(adj_cf_, key, value);
+  }
+
+  return db_->Write(WriteOptions(), &batch);
+}
+
+Status RocksGraph::AddEdgeBatch(
+    const std::vector<std::pair<node_id_t, node_id_t>>& edges) {
+  WriteBatch batch;
+  Status s;
+
+  // Group edges by vertex: out-neighbors and in-neighbors
+  std::unordered_map<node_id_t, std::vector<node_id_t>> out_by_vertex;
+  std::unordered_map<node_id_t, std::vector<node_id_t>> in_by_vertex;
+  for (const auto& e : edges) {
+    out_by_vertex[e.first].push_back(e.second);
+    in_by_vertex[e.second].push_back(e.first);
+  }
+
+  // Sort and deduplicate each vertex's neighbor list
+  auto sort_dedup = [](std::vector<node_id_t>& v) {
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+  };
+  for (auto& kv : out_by_vertex) sort_dedup(kv.second);
+  for (auto& kv : in_by_vertex) sort_dedup(kv.second);
+
+  // Collect all affected vertices
+  std::unordered_set<node_id_t> all_vertices;
+  for (const auto& kv : out_by_vertex) all_vertices.insert(kv.first);
+  for (const auto& kv : in_by_vertex) all_vertices.insert(kv.first);
+
+  for (node_id_t v : all_vertices) {
+    const auto out_it = out_by_vertex.find(v);
+    const auto in_it = in_by_vertex.find(v);
+    const std::vector<node_id_t>& new_outs =
+        out_it != out_by_vertex.end() ? out_it->second
+                                      : std::vector<node_id_t>{};
+    const std::vector<node_id_t>& new_ins =
+        in_it != in_by_vertex.end() ? in_it->second
+                                    : std::vector<node_id_t>{};
+
+    std::string key, value;
+    encode_node(v, &key);
+
+    int policy = edge_update_policy_;
+    if (policy == EDGE_UPDATE_FULL_LAZY) {
+      policy = EDGE_UPDATE_LAZY;
+    }
+    if (policy == EDGE_UPDATE_ADAPTIVE) {
+      policy = AdaptPolicy(v, update_ratio_, lookup_ratio_);
+    }
+
+    if (policy == EDGE_UPDATE_LAZY) {
+      // Build a single Edges struct with all new out/in edges for this vertex
+      Edges edges_to_merge{};
+      edges_to_merge.num_edges_out = static_cast<uint32_t>(new_outs.size());
+      edges_to_merge.num_edges_in = static_cast<uint32_t>(new_ins.size());
+      if (!new_outs.empty()) {
+        edges_to_merge.nxts_out = new Edge[new_outs.size()];
+        for (size_t i = 0; i < new_outs.size(); i++)
+          edges_to_merge.nxts_out[i] = Edge{.nxt = new_outs[i]};
+      }
+      if (!new_ins.empty()) {
+        edges_to_merge.nxts_in = new Edge[new_ins.size()];
+        for (size_t i = 0; i < new_ins.size(); i++)
+          edges_to_merge.nxts_in[i] = Edge{.nxt = new_ins[i]};
+      }
+      encode_edges(&edges_to_merge, &value, encoding_type_);
+      free_edges(&edges_to_merge);
+      batch.Merge(adj_cf_, key, value);
+
+      for (size_t i = 0; i < new_outs.size(); i++) mor.AddCounter(v);
+      for (size_t i = 0; i < new_ins.size(); i++) mor.AddCounter(v);
+      m += static_cast<node_id_t>(new_outs.size());
+    } else {
+      // Eager: read existing, merge-insert new edges
+      Edges existing{};
+      s = GetAllEdges(v, &existing);
+      if (!s.ok() && !s.IsNotFound()) {
+        return s;
+      }
+
+      // Merge-insert new out-edges (two-pointer merge, both sorted)
+      uint32_t max_out = existing.num_edges_out +
+                         static_cast<uint32_t>(new_outs.size());
+      Edge* merged_out = new Edge[max_out];
+      uint32_t ei = 0, ni = 0, ri = 0;
+      uint32_t out_added = 0;
+      while (ei < existing.num_edges_out && ni < new_outs.size()) {
+        if (existing.nxts_out[ei].nxt == new_outs[ni]) {
+          merged_out[ri++].nxt = existing.nxts_out[ei++].nxt;
+          ni++;  // duplicate, skip
+        } else if (existing.nxts_out[ei].nxt < new_outs[ni]) {
+          merged_out[ri++].nxt = existing.nxts_out[ei++].nxt;
+        } else {
+          merged_out[ri++].nxt = new_outs[ni++];
+          out_added++;
+        }
+      }
+      while (ei < existing.num_edges_out)
+        merged_out[ri++].nxt = existing.nxts_out[ei++].nxt;
+      while (ni < new_outs.size()) {
+        merged_out[ri++].nxt = new_outs[ni++];
+        out_added++;
+      }
+      uint32_t merged_out_count = ri;
+
+      // Merge-insert new in-edges
+      uint32_t max_in = existing.num_edges_in +
+                        static_cast<uint32_t>(new_ins.size());
+      Edge* merged_in = new Edge[max_in];
+      ei = 0; ni = 0; ri = 0;
+      uint32_t in_added = 0;
+      while (ei < existing.num_edges_in && ni < new_ins.size()) {
+        if (existing.nxts_in[ei].nxt == new_ins[ni]) {
+          merged_in[ri++].nxt = existing.nxts_in[ei++].nxt;
+          ni++;
+        } else if (existing.nxts_in[ei].nxt < new_ins[ni]) {
+          merged_in[ri++].nxt = existing.nxts_in[ei++].nxt;
+        } else {
+          merged_in[ri++].nxt = new_ins[ni++];
+          in_added++;
+        }
+      }
+      while (ei < existing.num_edges_in)
+        merged_in[ri++].nxt = existing.nxts_in[ei++].nxt;
+      while (ni < new_ins.size()) {
+        merged_in[ri++].nxt = new_ins[ni++];
+        in_added++;
+      }
+      uint32_t merged_in_count = ri;
+
+      Edges new_edges{};
+      new_edges.num_edges_out = merged_out_count;
+      new_edges.num_edges_in = merged_in_count;
+      new_edges.nxts_out = merged_out;
+      new_edges.nxts_in = merged_in;
+      encode_edges(&new_edges, &value, encoding_type_);
+      free_edges(&existing);
+      free_edges(&new_edges);
+      batch.Put(adj_cf_, key, value);
+
+      for (uint32_t i = 0; i < out_added; i++) mor.AddCounter(v);
+      for (uint32_t i = 0; i < in_added; i++) mor.AddCounter(v);
+      m += static_cast<node_id_t>(out_added);
+    }
+  }
+
+  return db_->Write(WriteOptions(), &batch);
+}
+
+Status RocksGraph::DeleteEdgeBatch(
+    const std::vector<std::pair<node_id_t, node_id_t>>& edges) {
+  WriteBatch batch;
+  Status s;
+
+  // Group edges by vertex for out-edge and in-edge deletion
+  std::unordered_map<node_id_t, std::vector<node_id_t>> del_out_by_vertex;
+  std::unordered_map<node_id_t, std::vector<node_id_t>> del_in_by_vertex;
+  for (const auto& e : edges) {
+    del_out_by_vertex[e.first].push_back(e.second);
+    del_in_by_vertex[e.second].push_back(e.first);
+  }
+
+  auto sort_dedup = [](std::vector<node_id_t>& v) {
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+  };
+  for (auto& kv : del_out_by_vertex) sort_dedup(kv.second);
+  for (auto& kv : del_in_by_vertex) sort_dedup(kv.second);
+
+  // Collect all affected vertices
+  std::unordered_set<node_id_t> all_vertices;
+  for (const auto& kv : del_out_by_vertex) all_vertices.insert(kv.first);
+  for (const auto& kv : del_in_by_vertex) all_vertices.insert(kv.first);
+
+  for (node_id_t v : all_vertices) {
+    const auto out_it = del_out_by_vertex.find(v);
+    const auto in_it = del_in_by_vertex.find(v);
+    const std::vector<node_id_t>& del_outs =
+        out_it != del_out_by_vertex.end() ? out_it->second
+                                          : std::vector<node_id_t>{};
+    const std::vector<node_id_t>& del_ins =
+        in_it != del_in_by_vertex.end() ? in_it->second
+                                        : std::vector<node_id_t>{};
+
+    std::string key, value;
+    encode_node(v, &key);
+
+    int policy = edge_update_policy_;
+    if (policy == EDGE_UPDATE_FULL_LAZY) {
+      policy = EDGE_UPDATE_LAZY;
+    }
+    if (policy == EDGE_UPDATE_ADAPTIVE) {
+      policy = AdaptPolicy(v, update_ratio_, lookup_ratio_);
+    }
+
+    if (policy == EDGE_UPDATE_LAZY && encoding_type_ != ENCODING_TYPE_EFP) {
+      // Lazy delete: use tombstone encoding -(id+1)
+      Edges tombstones{};
+      tombstones.num_edges_out = static_cast<uint32_t>(del_outs.size());
+      tombstones.num_edges_in = static_cast<uint32_t>(del_ins.size());
+      if (!del_outs.empty()) {
+        tombstones.nxts_out = new Edge[del_outs.size()];
+        for (size_t i = 0; i < del_outs.size(); i++)
+          tombstones.nxts_out[i] = Edge{.nxt = -(del_outs[i] + 1)};
+        // Sort tombstones by .nxt value for merge operator
+        std::sort(tombstones.nxts_out, tombstones.nxts_out + del_outs.size(),
+                  [](const Edge& a, const Edge& b) { return a.nxt < b.nxt; });
+      }
+      if (!del_ins.empty()) {
+        tombstones.nxts_in = new Edge[del_ins.size()];
+        for (size_t i = 0; i < del_ins.size(); i++)
+          tombstones.nxts_in[i] = Edge{.nxt = -(del_ins[i] + 1)};
+        std::sort(tombstones.nxts_in, tombstones.nxts_in + del_ins.size(),
+                  [](const Edge& a, const Edge& b) { return a.nxt < b.nxt; });
+      }
+      encode_edges(&tombstones, &value, encoding_type_);
+      free_edges(&tombstones);
+      batch.Merge(adj_cf_, key, value);
+    } else {
+      // Eager delete: read existing, filter out deleted edges
+      Edges existing{};
+      s = GetAllEdges(v, &existing);
+      if (!s.ok() && !s.IsNotFound()) {
+        return s;
+      }
+
+      std::unordered_set<node_id_t> del_out_set(del_outs.begin(),
+                                                 del_outs.end());
+      std::unordered_set<node_id_t> del_in_set(del_ins.begin(),
+                                                del_ins.end());
+
+      // Filter out-edges
+      Edge* new_out = new Edge[existing.num_edges_out];
+      uint32_t out_count = 0;
+      for (uint32_t i = 0; i < existing.num_edges_out; i++) {
+        if (del_out_set.count(existing.nxts_out[i].nxt)) {
+          mor.DecayCounter(v);
+          m--;
+        } else {
+          new_out[out_count++].nxt = existing.nxts_out[i].nxt;
+        }
+      }
+
+      // Filter in-edges
+      Edge* new_in = new Edge[existing.num_edges_in];
+      uint32_t in_count = 0;
+      for (uint32_t i = 0; i < existing.num_edges_in; i++) {
+        if (del_in_set.count(existing.nxts_in[i].nxt)) {
+          mor.DecayCounter(v);
+        } else {
+          new_in[in_count++].nxt = existing.nxts_in[i].nxt;
+        }
+      }
+
+      Edges new_edges{};
+      new_edges.num_edges_out = out_count;
+      new_edges.num_edges_in = in_count;
+      new_edges.nxts_out = new_out;
+      new_edges.nxts_in = new_in;
+      encode_edges(&new_edges, &value, encoding_type_);
+      free_edges(&existing);
+      free_edges(&new_edges);
+      batch.Put(adj_cf_, key, value);
+    }
+  }
+
+  return db_->Write(WriteOptions(), &batch);
+}
+
+Status RocksGraph::AddVertexProperty(node_id_t id, Property prop) {
+  VertexKey v{.id = id};
+  std::string key, value;
+  encode_node(v, &key);
+  concatenate_property(prop, &value);
+  return db_->Put(WriteOptions(), vertex_prop_cf_, key, value);
+}
+
+Status RocksGraph::AddEdgeProperty(node_id_t from, node_id_t to,
+                                   Property prop) {
+  VertexKey v{.id = from};
+  std::string key, value;
+  encode_node(v, &key);
+  encode_node(to, &value);
+  concatenate_property(prop, &value);
+  return db_->Merge(WriteOptions(), edge_prop_cf_, key, value);
+}
+
+Status RocksGraph::GetVertexProperty(node_id_t id,
+                                     std::vector<Property>& props) {
+  VertexKey v{.id = id};
+  std::string key;
+  encode_node(v, &key);
+  std::string value;
+  Status s = db_->Get(ReadOptions(), vertex_prop_cf_, key, &value);
+  if (!s.ok()) {
+    return s;
+  }
+  std::string::iterator it = value.begin();
+  decode_properties(it, props);
+  return Status::OK();
+}
+
+Status RocksGraph::GetEdgeProperty(node_id_t from, node_id_t to,
+                                   std::vector<Property>& props) {
+  VertexKey v{.id = from};
+  std::string key;
+  encode_node(v, &key);
+  std::string value;
+  Status s = db_->Get(ReadOptions(), edge_prop_cf_, key, &value);
+  if (!s.ok()) {
+    return s;
+  }
+  std::string::iterator it = value.begin();
+  node_id_t cur_node;
+  while (it < value.end()) {
+    cur_node = decode_id(it);
+    if (cur_node == to) {
+      decode_properties(it, props);
+    } else {
+      skip_properties(it);
+    }
+  }
+  return Status::OK();
+}
+
+std::vector<std::pair<node_id_t, node_id_t>> RocksGraph::GetEdgesWithProperty(
+    Property prop) {
+  std::vector<std::pair<node_id_t, node_id_t>> result;
+  node_id_t from, to;
+  std::unique_ptr<rocksdb::Iterator> it(
+      db_->NewIterator(ReadOptions(), edge_prop_cf_));
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    from = decode_node(it->key().ToString());
+    std::string value = it->value().ToString();
+    std::string::iterator str_it = value.begin();
+    while (str_it < value.end()) {
+      std::vector<Property> props;
+      to = decode_id(str_it);
+      decode_properties(str_it, props);
+      for (Property value_prop : props) {
+        if (value_prop.name == prop.name && value_prop.value == prop.value) {
+          result.push_back(std::make_pair(from, to));
+          break;
+        }
+      }
+    }
+  }
+
+  if (!it->status().ok()) {
+    std::cout << "An error occurred during iteration: "
+              << it->status().ToString() << std::endl;
+  }
+
+  return result;
+}
+
+std::vector<node_id_t> RocksGraph::GetVerticesWithProperty(Property prop) {
+  std::vector<node_id_t> result;
+  node_id_t from;
+  std::unique_ptr<rocksdb::Iterator> it(
+      db_->NewIterator(ReadOptions(), vertex_prop_cf_));
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    from = decode_node(it->key().ToString());
+    std::string value = it->value().ToString();
+    std::string::iterator str_it = value.begin();
+    while (str_it < value.end()) {
+      std::vector<Property> props;
+      decode_properties(str_it, props);
+      for (Property value_prop : props) {
+        if (value_prop.name == prop.name && value_prop.value == prop.value) {
+          result.push_back(from);
+          break;
+        }
+      }
+    }
+  }
+
+  if (!it->status().ok()) {
+    std::cout << "An error occurred during iteration: "
+              << it->status().ToString() << std::endl;
+  }
+
+  return result;
+}
+std::pair<std::string, std::string> RocksGraph::AddEdges(
+    node_id_t v, std::vector<node_id_t>& tos, std::vector<node_id_t>& froms) {
+  m += static_cast<node_id_t>(tos.size());
+  Edges new_edges{.num_edges_out = static_cast<uint32_t>(tos.size()),
+                  .num_edges_in = static_cast<uint32_t>(froms.size())};
+  VertexKey v_out{.id = v};
+  new_edges.nxts_out = new Edge[new_edges.num_edges_out];
+  new_edges.nxts_in = new Edge[new_edges.num_edges_in];
+  for (size_t i = 0; i < tos.size(); i++) {
+    new_edges.nxts_out[i].nxt = tos[i];
+    mor.AddCounter(v);
+  }
+  for (size_t i = 0; i < froms.size(); i++) {
+    new_edges.nxts_in[i].nxt = froms[i];
+    mor.AddCounter(v);
+  }
+  std::string new_value;
+  std::string key_out;
+  encode_node(v_out, &key_out);
+  encode_edges(&new_edges, &new_value, encoding_type_);
+  free_edges(&new_edges);
+  return std::make_pair(key_out, new_value);
+}
+
+Status RocksGraph::AddVertexWithEdges(node_id_t id,
+                                      std::vector<node_id_t>& out_neighbors,
+                                      std::vector<node_id_t>& in_neighbors) {
+  // Warn if vertex likely already exists (low-cost check via Morris Counter)
+  if (mor.GetVertexCount(id) > 0) {
+    fprintf(stderr,
+            "Warning: AddVertexWithEdges called on vertex %lld which may "
+            "already exist (degree estimate=%d). This API assumes the vertex "
+            "is new; existing data will be overwritten.\n",
+            (long long)id, mor.GetVertexCount(id));
+  }
+
+  // Sort and deduplicate edge lists
+  std::sort(out_neighbors.begin(), out_neighbors.end());
+  out_neighbors.erase(std::unique(out_neighbors.begin(), out_neighbors.end()),
+                      out_neighbors.end());
+  std::sort(in_neighbors.begin(), in_neighbors.end());
+  in_neighbors.erase(std::unique(in_neighbors.begin(), in_neighbors.end()),
+                     in_neighbors.end());
+
+  // Build the full adjacency list for this vertex
+  Edges edges;
+  edges.num_edges_out = static_cast<uint32_t>(out_neighbors.size());
+  edges.num_edges_in = static_cast<uint32_t>(in_neighbors.size());
+  edges.nxts_out = new Edge[edges.num_edges_out];
+  edges.nxts_in = new Edge[edges.num_edges_in];
+  for (uint32_t i = 0; i < edges.num_edges_out; i++) {
+    edges.nxts_out[i].nxt = out_neighbors[i];
+  }
+  for (uint32_t i = 0; i < edges.num_edges_in; i++) {
+    edges.nxts_in[i].nxt = in_neighbors[i];
+  }
+
+  VertexKey v{.id = id};
+  std::string key, value;
+  encode_node(v, &key);
+  encode_edges(&edges, &value, encoding_type_);
+  free_edges(&edges);
+
+  WriteBatch batch;
+
+  // Write the vertex adjacency list as a single entry
+  batch.Put(adj_cf_, key, value);
+
+  // Initialize property column families
+  batch.Put(edge_prop_cf_, key, "");
+  batch.Put(vertex_prop_cf_, key, "");
+
+  // Update counters
+  n++;
+  m += static_cast<node_id_t>(out_neighbors.size());
+  for (uint32_t i = 0; i < out_neighbors.size(); i++) {
+    mor.AddCounter(id);
+  }
+  for (uint32_t i = 0; i < in_neighbors.size(); i++) {
+    mor.AddCounter(id);
+  }
+
+  return db_->Write(WriteOptions(), &batch);
+}
+
+Status RocksGraph::DeleteEdge(node_id_t from, node_id_t to) {
+  Status s;
+  VertexKey v{.id = from};
+  std::string key_out, value_out;
+  encode_node(v, &key_out);
+  int out_policy = edge_update_policy_;
+  if (out_policy == EDGE_UPDATE_ADAPTIVE) {
+    out_policy = AdaptPolicy(from, update_ratio_, lookup_ratio_);
+  }
+  if (out_policy == EDGE_UPDATE_LAZY &&
+      encoding_type_ != ENCODING_TYPE_EFP) {
+    Edges edges{.num_edges_out = 1, .num_edges_in = 0};
+    edges.nxts_out = new Edge[1];
+    edges.nxts_out[0] = Edge{.nxt = -(to + 1)};
+    encode_edges(&edges, &value_out, encoding_type_);
+    free_edges(&edges);
+    s = db_->Merge(WriteOptions(), adj_cf_, key_out, value_out);
+    if (!s.ok() && !s.IsNotFound()) {
+      return s;
+    }
+  } else if (out_policy == EDGE_UPDATE_EAGER ||
+             encoding_type_ == ENCODING_TYPE_EFP) {
+    Edges existing_edges{.num_edges_out = 0};
+    s = GetAllEdges(from, &existing_edges);
+    if (!s.ok() && !s.IsNotFound()) {
+      return s;
+    }
+    Edges new_edges{.num_edges_out = existing_edges.num_edges_out,
+                    .num_edges_in = existing_edges.num_edges_in};
+    new_edges.nxts_in = new Edge[existing_edges.num_edges_in];
+    memcpy(new_edges.nxts_in, existing_edges.nxts_in,
+           existing_edges.num_edges_in * sizeof(Edge));
+    new_edges.nxts_out = new Edge[new_edges.num_edges_out];
+    node_id_t pivot_ex = 0;
+    uint32_t edge_count = 0;
+    while (pivot_ex < existing_edges.num_edges_out) {
+      if (existing_edges.nxts_out[pivot_ex].nxt == to) {
+        mor.DecayCounter(from);
+        m--;
+        pivot_ex++;
+      } else {
+        new_edges.nxts_out[edge_count++].nxt =
+            existing_edges.nxts_out[pivot_ex++].nxt;
+      }
+    }
+    new_edges.num_edges_out = edge_count;
+    std::string new_value;
+    encode_edges(&new_edges, &new_value, encoding_type_);
+    free_edges(&existing_edges);
+    free_edges(&new_edges);
+    s = db_->Put(WriteOptions(), adj_cf_, key_out, new_value);
+    if (!s.ok() && !s.IsNotFound()) {
+      return s;
+    }
+  }
+
+  VertexKey v_in{.id = to};
+  std::string key_in, value_in;
+  encode_node(v_in, &key_in);
+  int in_policy = edge_update_policy_;
+  if (in_policy == EDGE_UPDATE_ADAPTIVE) {
+    in_policy = AdaptPolicy(from, update_ratio_, lookup_ratio_);
+  }
+  if (in_policy == EDGE_UPDATE_LAZY && encoding_type_ != ENCODING_TYPE_EFP) {
+    Edges edges{.num_edges_out = 0, .num_edges_in = 1};
+    edges.nxts_in = new Edge[1];
+    edges.nxts_in[0] = Edge{.nxt = -(from + 1)};
+    encode_edges(&edges, &value_in, encoding_type_);
+    free_edges(&edges);
+    s = db_->Merge(WriteOptions(), adj_cf_, key_in, value_in);
+    if (!s.ok() && !s.IsNotFound()) {
+      return s;
+    }
+  } else if (in_policy == EDGE_UPDATE_EAGER ||
+             encoding_type_ == ENCODING_TYPE_EFP) {
+    Edges existing_edges{.num_edges_in = 0};
+    s = GetAllEdges(to, &existing_edges);
+    if (!s.ok() && !s.IsNotFound()) {
+      return s;
+    }
+    Edges new_edges{.num_edges_out = existing_edges.num_edges_out,
+                    .num_edges_in = existing_edges.num_edges_in};
+    // copy existing out edges
+    new_edges.nxts_out = new Edge[existing_edges.num_edges_out];
+    memcpy(new_edges.nxts_out, existing_edges.nxts_out,
+           existing_edges.num_edges_out * sizeof(Edge));
+    new_edges.nxts_in = new Edge[new_edges.num_edges_in];
+    node_id_t pivot_ex = 0;
+    uint32_t edge_count = 0;
+    while (pivot_ex < existing_edges.num_edges_in) {
+      if (existing_edges.nxts_in[pivot_ex].nxt == from) {
+        mor.DecayCounter(to);
+        pivot_ex++;
+      } else {
+        new_edges.nxts_in[edge_count++].nxt =
+            existing_edges.nxts_in[pivot_ex++].nxt;
+      }
+    }
+    new_edges.num_edges_in = edge_count;
+    std::string new_value;
+    encode_edges(&new_edges, &new_value, encoding_type_);
+    free_edges(&existing_edges);
+    free_edges(&new_edges);
+    s = db_->Put(WriteOptions(), adj_cf_, key_in, new_value);
+    if (!s.ok() && !s.IsNotFound()) {
+      return s;
+    }
+  }
+  return s;
+}
+
+Status RocksGraph::GetAllEdges(node_id_t src, Edges* edges) {
+  VertexKey v{.id = src};
+  std::string key;
+  encode_node(v, &key);
+  std::string value;
+  if (edge_update_policy_ == EDGE_UPDATE_FULL_LAZY) {
+    std::string start;
+    std::string end;
+    encode_node(v, &start);
+    // start.push_back(static_cast<char>(0x00));
+    encode_node(v, &end);
+    std::string::iterator sit = end.begin();
+    for (; *(sit + 1) != 0; ++sit) {
+    }
+    *sit = *sit + 1;
+
+    // end.push_back(static_cast<char>(0xFF));
+    //  std::cout<<"start: "<< start << std::endl;
+    //  std::cout<<"end: "<< end << std::endl;
+    Slice lower_key((char*)start.c_str());
+    Slice upper_key((char*)end.c_str());
+
+    rocksdb::ReadOptions read_options;
+    read_options.iterate_lower_bound = &lower_key;
+    read_options.iterate_upper_bound = &upper_key;
+
+    std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(read_options));
+    //int edge_count = 0;
+    for (it->Seek(start); it->Valid(); it->Next()) {
+      //edge_count++;
+      it->value();
+      // decode_edges(edges,  it->value().ToString(), encoding_type_);
+    }
+    // printf("edge_count: %d\t", edge_count);
+    return Status::OK();
+  }
+  Status s = db_->Get(ReadOptions(), adj_cf_, key, &value);
+  if (!s.ok()) {
+    return s;
+  }
+  decode_edges(edges, value, encoding_type_);
+  return Status::OK();
+  // if(edge_update_policy_ != EDGE_UPDATE_EAGER){
+  // GetMergeOperandsOptions merge_operands_info;
+  // int number_of_operands = 0;
+  // int maximum_levels = 10;
+  // merge_operands_info.expected_max_number_of_operands = maximum_levels;
+  // std::vector<PinnableSlice> values(maximum_levels);
+  // s = db_->GetMergeOperands(ReadOptions(), adj_cf_, key,
+  //                           values.data(), &merge_operands_info,
+  //                           &number_of_operands);
+  // }
+}
+
+node_id_t RocksGraph::GetOutDegree(node_id_t src) {
+  VertexKey v{.id = src};
+  std::string key;
+  encode_node(v, &key);
+  std::string value;
+  Status s = db_->Get(ReadOptions(), adj_cf_, key, &value);
+  if (!s.ok() || value.size() < sizeof(uint32_t)) return 0;
+  return *reinterpret_cast<const uint32_t*>(value.data());
+}
+
+node_id_t RocksGraph::GetInDegree(node_id_t src) {
+  VertexKey v{.id = src};
+  std::string key;
+  encode_node(v, &key);
+  std::string value;
+  Status s = db_->Get(ReadOptions(), adj_cf_, key, &value);
+  if (!s.ok() || value.size() < 2 * sizeof(uint32_t)) return 0;
+  return *reinterpret_cast<const uint32_t*>(value.data() + sizeof(uint32_t));
+}
+
+node_id_t RocksGraph::GetDegreeApproximate(node_id_t src,
+                                           int filter_type_manual) {
+  if (filter_type_manual > 0 && filter_type_ != FILTER_TYPE_ALL) {
+    printf(
+        "degree filter setting error: filter_type_manual > 0 should only be "
+        "set when FILTER_TYPE_ALL\n");
+  }
+  if (filter_type_manual == FILTER_TYPE_CMS ||
+      (filter_type_manual == 0 && filter_type_ == FILTER_TYPE_CMS)) {
+    return cms_out.GetVertexCount(src) + cms_in.GetVertexCount(src);
+  } else if (filter_type_manual == FILTER_TYPE_MORRIS ||
+             (filter_type_manual == 0 && filter_type_ == FILTER_TYPE_MORRIS)) {
+    return mor.GetVertexCount(src);
+  }
+  return 0;
+}
+
+// node_id_t RocksGraph::GetOutDegreeApproximate(node_id_t src,
+//                                               int filter_type_manual) {
+//   if (filter_type_manual > 0 && filter_type_ != FILTER_TYPE_ALL) {
+//     printf(
+//         "degree filter setting error: filter_type_manual > 0 should only be "
+//         "set when FILTER_TYPE_ALL\n");
+//   }
+//   if (filter_type_manual == FILTER_TYPE_CMS ||
+//       (filter_type_manual == 0 && filter_type_ == FILTER_TYPE_CMS)) {
+//     return cms_out.GetVertexCount(src);
+//   } else if (filter_type_manual == FILTER_TYPE_MORRIS ||
+//              (filter_type_manual == 0 && filter_type_ == FILTER_TYPE_MORRIS))
+//              {
+//     return mor_out.GetVertexCount(src) - mor_out_delete.GetVertexCount(src);
+//   }
+//   return 0;
+// }
+
+// node_id_t RocksGraph::GetInDegreeApproximate(node_id_t src,
+//                                              int filter_type_manual) {
+//   if (filter_type_manual > 0 && filter_type_ != FILTER_TYPE_ALL) {
+//     printf(
+//         "degree filter setting error: filter_type_manual > 0 should only be "
+//         "set when FILTER_TYPE_ALL\n");
+//   }
+//   if (filter_type_manual == FILTER_TYPE_CMS ||
+//       (filter_type_manual == 0 && filter_type_ == FILTER_TYPE_CMS)) {
+//     return cms_in.GetVertexCount(src);
+//   } else if (filter_type_manual == FILTER_TYPE_MORRIS ||
+//              (filter_type_manual == 0 && filter_type_ == FILTER_TYPE_MORRIS))
+//              {
+//     return mor_in.GetVertexCount(src) - mor_in_delete.GetVertexCount(src);
+//   }
+//   return 0;
+// }
+
+// Status RocksGraph::GetVertexVal(node_id_t id, Value* val) {
+//   VertexKey v{.id = id, .type = KEY_TYPE_PROPERTY};
+//   std::string key;
+//   encode_node(v, &key);
+//   std::string value;
+//   Status s = db_->Get(ReadOptions(), edge_prop_cf_, key, &value);
+//   if (!s.ok()) {
+//     return s;
+//   }
+//   *val = *reinterpret_cast<const Value*>(value.data());
+//   return Status::OK();
+// }
+
+// Status RocksGraph::SetVertexVal(node_id_t id, Value val) {
+//   VertexKey v{.id = id, .type = KEY_TYPE_PROPERTY};
+//   std::string key;
+//   encode_node(v, &key);
+//   std::string value;
+//   value.append(reinterpret_cast<const char*>(&val), sizeof(Value));
+//   return db_->Put(WriteOptions(), edge_prop_cf_, key, value);
+// }
+
+// Status RocksGraph::SimpleWalk(node_id_t start, float decay_factor) {
+//   random_walk(start, decay_factor);
+//   return Status::OK();
+// }
+
+}  // namespace ROCKSDB_NAMESPACE
