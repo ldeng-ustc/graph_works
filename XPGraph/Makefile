@@ -18,7 +18,7 @@ clean:
 	@rm -rf bin/
 	@rm -rf src/api/lib
 
-main: main.cpp $(HEADERS)
+main: lib main.cpp $(HEADERS)
 	@mkdir -p bin/
 	$(CPP) $(CPPFLAGS) $(LDFLAGS) main.cpp -o bin/main $(LINKERFLAGS)
 

@@ -35,7 +35,27 @@
 cmake_minimum_required(VERSION 3.10)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/modules/")
-include(ReadVersion)
+include(FetchContent)
+
+function(get_rocksdb_version out_var)
+  file(READ "${CMAKE_CURRENT_LIST_DIR}/include/rocksdb/version.h" ROCKSDB_VERSION_HEADER)
+
+  string(REGEX MATCH "#define[ \t]+ROCKSDB_MAJOR[ \t]+([0-9]+)" _rocksdb_major_match "${ROCKSDB_VERSION_HEADER}")
+  set(_rocksdb_major "${CMAKE_MATCH_1}")
+
+  string(REGEX MATCH "#define[ \t]+ROCKSDB_MINOR[ \t]+([0-9]+)" _rocksdb_minor_match "${ROCKSDB_VERSION_HEADER}")
+  set(_rocksdb_minor "${CMAKE_MATCH_1}")
+
+  string(REGEX MATCH "#define[ \t]+ROCKSDB_PATCH[ \t]+([0-9]+)" _rocksdb_patch_match "${ROCKSDB_VERSION_HEADER}")
+  set(_rocksdb_patch "${CMAKE_MATCH_1}")
+
+  if("${_rocksdb_major}" STREQUAL "" OR "${_rocksdb_minor}" STREQUAL "" OR "${_rocksdb_patch}" STREQUAL "")
+    message(FATAL_ERROR "Failed to parse RocksDB version from include/rocksdb/version.h")
+  endif()
+
+  set(${out_var} "${_rocksdb_major}.${_rocksdb_minor}.${_rocksdb_patch}" PARENT_SCOPE)
+endfunction()
+
 include(GoogleTest)
 get_rocksdb_version(rocksdb_VERSION)
 project(rocksdb
@@ -127,8 +147,32 @@ else()
         set(GFLAGS_LIB ${gflags_LIBRARIES})
       endif()
     else()
-      find_package(gflags REQUIRED)
-      set(GFLAGS_LIB gflags::gflags)
+      find_package(gflags QUIET)
+      if(gflags_FOUND AND TARGET gflags::gflags)
+        set(GFLAGS_LIB gflags::gflags)
+      else()
+        message(STATUS "gflags not found locally; fetching a pinned release for Aster")
+        set(GFLAGS_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+        set(GFLAGS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+        set(GFLAGS_BUILD_PACKAGING OFF CACHE BOOL "" FORCE)
+        set(GFLAGS_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+          gflags
+          GIT_REPOSITORY https://github.com/gflags/gflags.git
+          GIT_TAG v2.2.2
+          GIT_SHALLOW TRUE
+          GIT_SUBMODULES ""
+          GIT_SUBMODULES_RECURSE FALSE
+        )
+        FetchContent_MakeAvailable(gflags)
+        if(TARGET gflags::gflags)
+          set(GFLAGS_LIB gflags::gflags)
+        elseif(TARGET gflags)
+          set(GFLAGS_LIB gflags)
+        else()
+          message(FATAL_ERROR "gflags fetch succeeded but no usable CMake target was created")
+        endif()
+      endif()
     endif()
     include_directories(${GFLAGS_INCLUDE_DIR})
     list(APPEND THIRDPARTY_LIBS ${GFLAGS_LIB})
@@ -338,6 +382,13 @@ if(FAIL_ON_WARNINGS)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /WX")
   else() # assume GCC
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+  endif()
+else()
+  if(MSVC)
+    string(REPLACE "/WX" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  else()
+    string(REPLACE "-Werror" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REPLACE "-Werror" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
   endif()
 endif()
 
@@ -1106,6 +1157,20 @@ string(REGEX REPLACE "[^0-9: /-]+" "" GIT_DATE "${GIT_DATE}")
 set(BUILD_VERSION_CC ${CMAKE_BINARY_DIR}/build_version.cc)
 configure_file(util/build_version.cc.in ${BUILD_VERSION_CC} @ONLY)
 
+option(ASTER_MINIMAL_BUILD
+  "Force a minimal default build focused on librocksdb and aster_bin32_bench"
+  ON)
+
+if(ASTER_MINIMAL_BUILD)
+  set(FAIL_ON_WARNINGS OFF CACHE BOOL "Treat compile warnings as errors" FORCE)
+  set(ROCKSDB_BUILD_SHARED OFF CACHE BOOL "Build shared versions of the RocksDB libraries" FORCE)
+endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_source_files_properties(util/xxhash.cc PROPERTIES
+    COMPILE_OPTIONS "-Wno-error=maybe-uninitialized")
+endif()
+
 add_library(${ROCKSDB_STATIC_LIB} STATIC ${SOURCES} ${BUILD_VERSION_CC})
 target_link_libraries(${ROCKSDB_STATIC_LIB} PRIVATE
   ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
@@ -1138,10 +1203,6 @@ if(ROCKSDB_BUILD_SHARED AND NOT WIN32)
 else()
   set(ROCKSDB_LIB ${ROCKSDB_STATIC_LIB})
 endif()
-
-option(ASTER_MINIMAL_BUILD
-  "Force a minimal default build focused on librocksdb and aster_bin32_bench"
-  ON)
 
 option(WITH_JNI "build with JNI" OFF)
 # Tests are excluded from Release builds
@@ -1177,7 +1238,7 @@ endif()
 if(WIN32)
   option(ROCKSDB_INSTALL_ON_WINDOWS "Enable install target on Windows" OFF)
 endif()
-if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)
+if((NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS) AND NOT ASTER_MINIMAL_BUILD)
   if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
       # Change default installation prefix on Linux to /usr

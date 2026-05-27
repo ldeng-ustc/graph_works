@@ -393,11 +393,16 @@ findpkg_finish(TBB_MALLOC_PROXY tbbmalloc_proxy)
 #parse all the version numbers from tbb
 if(NOT TBB_VERSION)
 
- #only read the start of the file
- file(STRINGS
-      "${TBB_INCLUDE_DIR}/tbb/tbb_stddef.h"
+  set(TBB_VERSION_HEADER "${TBB_INCLUDE_DIR}/tbb/version.h")
+  if(NOT EXISTS "${TBB_VERSION_HEADER}")
+    set(TBB_VERSION_HEADER "${TBB_INCLUDE_DIR}/tbb/tbb_stddef.h")
+  endif ()
+
+  #only read the start of the file
+  file(STRINGS
+      "${TBB_VERSION_HEADER}"
       TBB_VERSION_CONTENTS
-      REGEX "VERSION")
+      REGEX "TBB_VERSION|TBB_INTERFACE_VERSION|TBB_COMPATIBLE_INTERFACE_VERSION|__TBB_BINARY_VERSION")
 
   string(REGEX REPLACE
     ".*#define TBB_VERSION_MAJOR ([0-9]+).*" "\\1"
@@ -414,5 +419,15 @@ if(NOT TBB_VERSION)
   string(REGEX REPLACE
         ".*#define TBB_COMPATIBLE_INTERFACE_VERSION ([0-9]+).*" "\\1"
         TBB_COMPATIBLE_INTERFACE_VERSION "${TBB_VERSION_CONTENTS}")
+
+  if(TBB_COMPATIBLE_INTERFACE_VERSION STREQUAL "${TBB_VERSION_CONTENTS}")
+    string(REGEX REPLACE
+          ".*#define __TBB_BINARY_VERSION ([0-9]+).*" "\\1"
+          TBB_COMPATIBLE_INTERFACE_VERSION "${TBB_VERSION_CONTENTS}")
+  endif ()
+
+  if(TBB_COMPATIBLE_INTERFACE_VERSION STREQUAL "${TBB_VERSION_CONTENTS}")
+    set(TBB_COMPATIBLE_INTERFACE_VERSION "${TBB_INTERFACE_VERSION}")
+  endif ()
 
 endif()

@@ -11,7 +11,7 @@ HEADERS=$(shell find . -name '*.hpp')
 LIB = lib/libxpgraph.so
 OBJ = lib/libxpgraph.o
 
-all: clean $(LIB)
+all: $(LIB)
 
 $(LIB) : $(OBJ)
 	$(CPP) $(CPPFLAGS) $^ -o $@ $(LINKERFLAGS) $(LDFLAGS)
