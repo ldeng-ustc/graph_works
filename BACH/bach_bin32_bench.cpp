@@ -30,10 +30,15 @@ struct Edge32 {
 
 static_assert(sizeof(Edge32) == sizeof(uint32_t) * 2, "Edge32 must be 8 bytes");
 
+// Streaming chunk: 16 MiB (8 bytes per edge → 2M edges per chunk).
+constexpr size_t kStreamChunkBytes = 16ull << 20;
+constexpr size_t kStreamChunkEdges = kStreamChunkBytes / sizeof(Edge32);
+
 struct Options {
     std::string input_path;
     std::string storage_dir;
-    size_t ingest_batch_edges = 1 << 20;
+    size_t num_vertices = 0;  // required, passed from driver via --num-vertices
+    size_t ingest_batch_edges = kStreamChunkEdges;
     size_t num_threads =
         std::max<size_t>(1, std::thread::hardware_concurrency() == 0
                                ? 1
@@ -47,13 +52,14 @@ struct Options {
     int64_t debug_vertex = -1;
     bool reset = false;
     bool compact = false;
+    size_t max_batch = 0;  // 0 = no limit; otherwise stop after this many 16MiB batches
 };
 
 struct LoadedGraph {
-    std::vector<Edge32> edges;
     std::vector<uint32_t> out_degree;
     std::vector<uint32_t> in_degree;
     uint32_t num_vertices = 0;
+    size_t total_edges = 0;
 };
 
 #include "graph_benchmarks.hpp"
@@ -72,10 +78,11 @@ struct BACHDbHandles {
 
 void print_usage(const char* argv0) {
     std::cerr
-        << "Usage: " << argv0 << " -f <graph.bin32> [options]\n"
+        << "Usage: " << argv0 << " -f <graph.bin32> --num-vertices <n> [options]\n"
         << "Options:\n"
+        << "  --num-vertices <n>    Vertex count from datasets.py (REQUIRED)\n"
         << "  --storage <dir>       Storage root, default ../data/bach-bench/<dataset>\n"
-        << "  --ingest-batch-edges <n>  Edge count per ingest transaction, default 1048576\n"
+        << "  --ingest-batch-edges <n>  Edge count per ingest chunk, default 2097152 (16 MiB)\n"
         << "  --threads <n>         Worker threads for ingest, default hardware concurrency\n"
         << "  --algo-threads <n>    Worker threads for BFS/PR/CC, default same as --threads\n"
         << "  --pr-iters <n>        PageRank iterations, default 10\n"
@@ -85,7 +92,8 @@ void print_usage(const char* argv0) {
         << "  --cc-neighbor-rounds <n>  CC sampled neighbor rounds, default 2\n"
         << "  --debug-vertex <id>   Print out/in neighbors for one vertex and exit after ingest\n"
         << "  --compact             Run DB::CompactAll() after ingest\n"
-        << "  --reset               Remove existing storage dir before ingest\n";
+        << "  --reset               Remove existing storage dir before ingest\n"
+        << "  --max-batch <n>       Stop ingest after N 16MiB batches (0=no limit)\n";
 }
 
 Options parse_args(int argc, char* argv[]) {
@@ -101,6 +109,8 @@ Options parse_args(int argc, char* argv[]) {
 
         if (arg == "-f" || arg == "--file") {
             opts.input_path = require_value(arg.c_str());
+        } else if (arg == "--num-vertices") {
+            opts.num_vertices = std::stoull(require_value("--num-vertices"));
         } else if (arg == "--storage") {
             opts.storage_dir = require_value("--storage");
         } else if (arg == "--ingest-batch-edges") {
@@ -125,6 +135,8 @@ Options parse_args(int argc, char* argv[]) {
             opts.reset = true;
         } else if (arg == "--compact") {
             opts.compact = true;
+        } else if (arg == "--max-batch") {
+            opts.max_batch = std::stoull(require_value("--max-batch"));
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             std::exit(0);
@@ -135,6 +147,9 @@ Options parse_args(int argc, char* argv[]) {
 
     if (opts.input_path.empty()) {
         throw std::runtime_error("Please specify -f <graph.bin32>");
+    }
+    if (opts.num_vertices == 0) {
+        throw std::runtime_error("Please specify --num-vertices <n> (from datasets.py)");
     }
     if (opts.algo_threads == 0) {
         opts.algo_threads = opts.num_threads;
@@ -162,39 +177,12 @@ std::string dataset_name_from_path(const std::string& path) {
     return p.stem().empty() ? "dataset" : p.stem().string();
 }
 
-LoadedGraph load_bin32_graph(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("Failed to open input file: " + path);
-    }
-
-    in.seekg(0, std::ios::end);
-    std::streamsize bytes = in.tellg();
-    in.seekg(0, std::ios::beg);
-    if (bytes < 0 || bytes % static_cast<std::streamsize>(sizeof(Edge32)) != 0) {
-        throw std::runtime_error("Input file is not a valid bin32 edge list");
-    }
-
+LoadedGraph make_empty_loaded_graph(uint32_t num_vertices) {
     LoadedGraph graph;
-    graph.edges.resize(static_cast<size_t>(bytes / static_cast<std::streamsize>(sizeof(Edge32))));
-    if (!graph.edges.empty()) {
-        in.read(reinterpret_cast<char*>(graph.edges.data()), bytes);
-        if (!in) {
-            throw std::runtime_error("Failed to read all edges from input file");
-        }
-    }
-
-    uint32_t max_vertex = 0;
-    for (const auto& edge : graph.edges) {
-        max_vertex = std::max(max_vertex, std::max(edge.src, edge.dst));
-    }
-    graph.num_vertices = graph.edges.empty() ? 0 : (max_vertex + 1);
-    graph.out_degree.assign(graph.num_vertices, 0);
-    graph.in_degree.assign(graph.num_vertices, 0);
-    for (const auto& edge : graph.edges) {
-        ++graph.out_degree[edge.src];
-        ++graph.in_degree[edge.dst];
-    }
+    graph.num_vertices = num_vertices;
+    graph.out_degree.assign(num_vertices, 0);
+    graph.in_degree.assign(num_vertices, 0);
+    graph.total_edges = 0;
     return graph;
 }
 
@@ -270,20 +258,40 @@ void ingest_vertices(BACH::DB& db, uint32_t num_vertices, BACH::label_t vertex_l
 }
 
 void ingest_edges(BACH::DB& db,
-                  const LoadedGraph& loaded,
+                  LoadedGraph& loaded,
                   const Options& opts,
                   BACHBenchmarkLabels labels) {
-    std::printf("[ingest] loading %zu edges with batch_size=%zu\n",
-                loaded.edges.size(),
-                opts.ingest_batch_edges);
-    const auto ingest_begin = std::chrono::steady_clock::now();
-    const size_t total_batches =
-        (loaded.edges.size() + opts.ingest_batch_edges - 1) / opts.ingest_batch_edges;
+    std::printf("[ingest] streaming edges from %s with chunk_edges=%zu (%zu MiB)\n",
+                opts.input_path.c_str(),
+                opts.ingest_batch_edges,
+                (opts.ingest_batch_edges * sizeof(Edge32)) >> 20);
 
-    for (size_t begin = 0, batch_id = 0; begin < loaded.edges.size(); begin += opts.ingest_batch_edges) {
-        const size_t end = std::min(begin + opts.ingest_batch_edges, loaded.edges.size());
-        const size_t batch_edges = end - begin;
-        const size_t batch_threads = clamp_thread_count(opts.num_threads, batch_edges);
+    std::FILE* fp = std::fopen(opts.input_path.c_str(), "rb");
+    if (!fp) {
+        throw std::runtime_error("Failed to open input file: " + opts.input_path);
+    }
+
+    std::fseek(fp, 0, SEEK_END);
+    const long file_bytes = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    if (file_bytes < 0 || file_bytes % static_cast<long>(sizeof(Edge32)) != 0) {
+        std::fclose(fp);
+        throw std::runtime_error("Input file is not a valid bin32 edge list");
+    }
+    const size_t total_edges = static_cast<size_t>(file_bytes) / sizeof(Edge32);
+    const size_t total_batches =
+        total_edges == 0 ? 0 : (total_edges + opts.ingest_batch_edges - 1) / opts.ingest_batch_edges;
+
+    std::vector<Edge32> chunk(opts.ingest_batch_edges);
+    const auto ingest_begin = std::chrono::steady_clock::now();
+    size_t cursor = 0;
+    size_t batch_id = 0;
+    while (true) {
+        const size_t want = opts.ingest_batch_edges;
+        const size_t got = std::fread(chunk.data(), sizeof(Edge32), want, fp);
+        if (got == 0) break;
+
+        const size_t batch_threads = clamp_thread_count(opts.num_threads, got);
         const auto batch_begin = std::chrono::steady_clock::now();
         std::atomic<bool> failed(false);
         std::exception_ptr first_exception;
@@ -297,8 +305,8 @@ void ingest_edges(BACH::DB& db,
             try {
                 auto tx = db.BeginTransaction();
                 #pragma omp for schedule(static)
-                for (int64_t i = static_cast<int64_t>(begin); i < static_cast<int64_t>(end); ++i) {
-                    const auto& edge = loaded.edges[static_cast<size_t>(i)];
+                for (int64_t i = 0; i < static_cast<int64_t>(got); ++i) {
+                    const auto& edge = chunk[static_cast<size_t>(i)];
                     tx.PutEdge(edge.src, edge.dst, labels.edge_out_label, 1.0);
                     tx.PutEdge(edge.dst, edge.src, labels.edge_in_label, 1.0);
                 }
@@ -314,28 +322,46 @@ void ingest_edges(BACH::DB& db,
         }
 
         if (first_exception) {
+            std::fclose(fp);
             std::rethrow_exception(first_exception);
         }
 
+        // Tally degrees serially after the parallel ingest section.
+        for (size_t i = 0; i < got; ++i) {
+            const auto& edge = chunk[i];
+            if (edge.src < loaded.num_vertices) ++loaded.out_degree[edge.src];
+            if (edge.dst < loaded.num_vertices) ++loaded.in_degree[edge.dst];
+        }
+        loaded.total_edges += got;
+        cursor += got;
         ++batch_id;
+
         const double elapsed = seconds_since(ingest_begin);
         const double batch_seconds = seconds_since(batch_begin);
-        const double progress = loaded.edges.empty()
+        const double progress = total_edges == 0
                                     ? 100.0
-                                    : 100.0 * static_cast<double>(end) /
-                                          static_cast<double>(loaded.edges.size());
-        const double ingest_rate = elapsed > 0.0 ? static_cast<double>(end) / elapsed / 1e6 : 0.0;
-        std::printf("[ingest] batch=%zu/%zu edges=[%zu,%zu) threads=%zu progress=%.2f%% batch_time=%.4f elapsed=%.4f rate=%.4fM edges/s\n",
+                                    : 100.0 * static_cast<double>(cursor) /
+                                          static_cast<double>(total_edges);
+        const double ingest_rate = elapsed > 0.0 ? static_cast<double>(cursor) / elapsed / 1e6 : 0.0;
+        std::printf("[ingest] batch=%zu/%zu edges=%zu cursor=%zu threads=%zu progress=%.2f%% batch_time=%.4f elapsed=%.4f rate=%.4fM edges/s\n",
                     batch_id,
                     total_batches,
-                    begin,
-                    end,
+                    got,
+                    cursor,
                     batch_threads,
                     progress,
                     batch_seconds,
                     elapsed,
                     ingest_rate);
+
+        if (got < want) break;  // EOF
+        if (opts.max_batch != 0 && batch_id >= opts.max_batch) {
+            std::printf("[ingest] reached --max-batch=%zu, stopping early\n", opts.max_batch);
+            break;
+        }
     }
+
+    std::fclose(fp);
 }
 
 void maybe_compact(BACH::DB& db, bool compact) {
@@ -442,12 +468,11 @@ int main(int argc, char* argv[]) {
         log_config(opts);
 
         const auto load_begin = std::chrono::steady_clock::now();
-        std::printf("[load] reading bin32 graph\n");
-        LoadedGraph loaded = load_bin32_graph(opts.input_path);
+        // Driver supplied num_vertices via --num-vertices, no input scan needed.
+        LoadedGraph loaded = make_empty_loaded_graph(static_cast<uint32_t>(opts.num_vertices));
         const double load_seconds = seconds_since(load_begin);
-        std::printf("[load] done vertices=%u edges=%zu time=%.4f\n",
+        std::printf("[load] vertices=%u (from --num-vertices) time=%.4f\n",
                     loaded.num_vertices,
-                    loaded.edges.size(),
                     load_seconds);
 
         prepare_storage_dir(opts.storage_dir, opts.reset);
@@ -472,7 +497,7 @@ int main(int argc, char* argv[]) {
             *handles.db, handles.benchmark_labels(), loaded, make_benchmark_config(opts));
         const double total_seconds = seconds_since(bench_begin);
         print_summary(
-            load_seconds, ingest_seconds, rss_ingest, result, loaded.edges.size(), total_seconds);
+            load_seconds, ingest_seconds, rss_ingest, result, loaded.total_edges, total_seconds);
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;

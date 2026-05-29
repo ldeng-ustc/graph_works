@@ -25,6 +25,7 @@ struct Options {
   std::string input_path;
   std::string storage_dir;
   std::string dataset_name;
+  size_t num_vertices = 0;  // required, passed from driver via --num-vertices
   size_t num_threads = 1;
   size_t algo_threads = 1;
   size_t memtable_num = 2;
@@ -34,13 +35,16 @@ struct Options {
   size_t cc_neighbor_rounds = 2;
   double pr_epsilon = 0.0;
   bool reset = false;
+  size_t max_batch = 0;  // 0 = no limit; otherwise stop after this many 16MiB batches
 };
 
-constexpr size_t kDefaultIngestBatchEdges = 1ull << 20;
+// Streaming chunk: 16 MiB (8 bytes per edge → 2M edges per chunk).
+constexpr size_t kStreamChunkBytes = 16ull << 20;
+constexpr size_t kStreamChunkEdges = kStreamChunkBytes / (2 * sizeof(uint32_t));
+constexpr size_t kDefaultIngestBatchEdges = kStreamChunkEdges;
 
 struct StoragePaths {
   std::string out_storage_dir;
-  std::string in_storage_dir;
 };
 
 double now_seconds() {
@@ -83,7 +87,8 @@ void print_usage(const char* argv0) {
                "  --cc-rounds <n>          CC rounds, default 10\n"
                "  --cc-neighbor-rounds <n> CC sampled neighbor rounds, default 2\n"
                "  --pr-epsilon <x>         PageRank early-stop epsilon, default 0\n"
-               "  --reset                  Remove storage dir before ingest\n",
+               "  --reset                  Remove storage dir before ingest\n"
+               "  --max-batch <n>          Stop ingest after N 16MiB batches (0=no limit)\n",
                argv0);
 }
 
@@ -93,6 +98,8 @@ Options parse_options(int argc, char** argv) {
     const std::string arg = argv[i];
     if (arg == "-f" || arg == "--input") {
       opts.input_path = require_value(arg, i, argc, argv);
+    } else if (arg == "--num-vertices") {
+      opts.num_vertices = std::stoull(require_value(arg, i, argc, argv));
     } else if (arg == "--storage") {
       opts.storage_dir = require_value(arg, i, argc, argv);
     } else if (arg == "--dataset") {
@@ -115,6 +122,8 @@ Options parse_options(int argc, char** argv) {
       opts.pr_epsilon = std::stod(require_value(arg, i, argc, argv));
     } else if (arg == "--reset") {
       opts.reset = true;
+    } else if (arg == "--max-batch") {
+      opts.max_batch = std::stoull(require_value(arg, i, argc, argv));
     } else if (arg == "-h" || arg == "--help") {
       print_usage(argv[0]);
       std::exit(0);
@@ -128,6 +137,9 @@ Options parse_options(int argc, char** argv) {
   }
   if (opts.storage_dir.empty()) {
     throw std::runtime_error("storage directory is required");
+  }
+  if (opts.num_vertices == 0) {
+    throw std::runtime_error("--num-vertices is required (from datasets.py)");
   }
   if (opts.num_threads == 0 || opts.algo_threads == 0 || opts.memtable_num == 0) {
     throw std::runtime_error("thread counts and memtable count must be > 0");
@@ -156,42 +168,14 @@ void log_config(const Options& opts) {
 StoragePaths make_storage_paths(const Options& opts) {
   StoragePaths paths;
   paths.out_storage_dir = (fs::path(opts.storage_dir) / "out").string();
-  paths.in_storage_dir = (fs::path(opts.storage_dir) / "in").string();
   return paths;
 }
 
-lsmg_bench::LoadedGraph load_bin32_graph(const std::string& path) {
+lsmg_bench::LoadedGraph make_empty_loaded_graph(uint64_t num_vertices) {
   lsmg_bench::LoadedGraph graph;
-  std::ifstream file(path, std::ios::binary);
-  if (!file) {
-    throw std::runtime_error("failed to open input file: " + path);
-  }
-
-  file.seekg(0, std::ios::end);
-  const std::streamoff file_size = file.tellg();
-  file.seekg(0, std::ios::beg);
-  if (file_size < 0 || (file_size % (2 * static_cast<std::streamoff>(sizeof(uint32_t)))) != 0) {
-    throw std::runtime_error("input file size is not aligned to bin32 edge pairs");
-  }
-
-  const uint64_t edge_count = static_cast<uint64_t>(file_size) / (2 * sizeof(uint32_t));
-  graph.edges.reserve(edge_count);
-
-  uint32_t max_vertex = 0;
-  lsmg_bench::LoadedGraph::EdgePair edge;
-  while (file.read(reinterpret_cast<char*>(&edge), sizeof(edge))) {
-    graph.edges.push_back(edge);
-    max_vertex = std::max(max_vertex, std::max(edge.src, edge.dst));
-  }
-
-  graph.num_vertices = graph.edges.empty() ? 0 : static_cast<uint64_t>(max_vertex) + 1;
-  graph.out_degree.assign(graph.num_vertices, 0);
-  graph.in_degree.assign(graph.num_vertices, 0);
-  for (const auto& e : graph.edges) {
-    graph.out_degree[e.src]++;
-    graph.in_degree[e.dst]++;
-  }
-
+  graph.num_vertices = num_vertices;
+  graph.out_degree.assign(num_vertices, 0);
+  graph.in_degree.assign(num_vertices, 0);
   return graph;
 }
 
@@ -219,26 +203,6 @@ lsmg::LSMGraph* open_graph(const Options& opts, const std::string& storage_dir, 
   return db;
 }
 
-void wait_for_background_work(lsmg::LSMGraph& db,
-                              const Options& opts,
-                              const std::string& storage_dir,
-                              const char* graph_tag,
-                              size_t batch,
-                              size_t total_batches) {
-  configure_lsmgraph_flags(opts, storage_dir);
-  const double wait_begin = now_seconds();
-  db.AwaitWrite();
-  while (db.GetCompactionState()) {
-    std::this_thread::sleep_for(std::chrono::microseconds(20));
-  }
-  const double wait_seconds = now_seconds() - wait_begin;
-  std::printf("[ingest] graph=%s batch=%zu/%zu background_wait=%.4f\n",
-              graph_tag,
-              batch + 1,
-              total_batches,
-              wait_seconds);
-}
-
 void create_vertices(lsmg::LSMGraph& db,
                      uint32_t num_vertices,
                      const char* tag) {
@@ -254,54 +218,89 @@ void create_vertices(lsmg::LSMGraph& db,
   std::printf("[ingest] vertices done graph=%s time=%.4f\n", tag, now_seconds() - vertex_begin);
 }
 
-void ingest_single_graph(lsmg::LSMGraph& db,
-                         const lsmg_bench::LoadedGraph& graph,
-                         const Options& opts,
-                         const std::string& storage_dir,
-                         bool reverse_edges,
-                         const char* graph_tag) {
-  std::printf("[ingest] loading %zu edges graph=%s reverse=%d with batch_size=%zu\n",
-              graph.edges.size(),
-              graph_tag,
-              reverse_edges ? 1 : 0,
-              kDefaultIngestBatchEdges);
+// Stream the bin32 file once, ingesting each chunk into out_db (forward edges
+// only) and accumulating out/in degree counters.
+size_t stream_ingest_single(lsmg::LSMGraph& out_db,
+                            lsmg_bench::LoadedGraph& graph,
+                            const Options& opts,
+                            const StoragePaths& storage_paths) {
+  std::printf("[ingest] streaming edges from %s with chunk_edges=%zu (%zu MiB)\n",
+              opts.input_path.c_str(),
+              kStreamChunkEdges,
+              kStreamChunkBytes >> 20);
+
+  std::FILE* fp = std::fopen(opts.input_path.c_str(), "rb");
+  if (!fp) {
+    throw std::runtime_error("failed to open input file: " + opts.input_path);
+  }
+
+  std::fseek(fp, 0, SEEK_END);
+  const long file_bytes = std::ftell(fp);
+  std::fseek(fp, 0, SEEK_SET);
+  const size_t edge_size = 2 * sizeof(uint32_t);
+  if (file_bytes < 0 || file_bytes % static_cast<long>(edge_size) != 0) {
+    std::fclose(fp);
+    throw std::runtime_error("input file size is not aligned to bin32 edge pairs");
+  }
+  const size_t total_edges = static_cast<size_t>(file_bytes) / edge_size;
   const size_t total_batches =
-      graph.edges.empty() ? 0 : ((graph.edges.size() + kDefaultIngestBatchEdges - 1) / kDefaultIngestBatchEdges);
+      total_edges == 0 ? 0 : (total_edges + kStreamChunkEdges - 1) / kStreamChunkEdges;
+
+  std::vector<lsmg_bench::LoadedGraph::EdgePair> chunk(kStreamChunkEdges);
+  size_t cursor = 0;
+  size_t batch_id = 0;
   const double ingest_begin = now_seconds();
-  for (size_t batch = 0; batch < total_batches; ++batch) {
-    const size_t begin = batch * kDefaultIngestBatchEdges;
-    const size_t end = std::min(begin + kDefaultIngestBatchEdges, graph.edges.size());
+  configure_lsmgraph_flags(opts, storage_paths.out_storage_dir);
+  while (true) {
+    const size_t got = std::fread(chunk.data(), edge_size, kStreamChunkEdges, fp);
+    if (got == 0) break;
 
-    configure_lsmgraph_flags(opts, storage_dir);
     const double batch_begin = now_seconds();
-#pragma omp parallel for num_threads(opts.num_threads) schedule(dynamic, 65536)
-    for (uint64_t i = begin; i < end; ++i) {
-      const auto& e = graph.edges[i];
-      if (reverse_edges) {
-        db.put_edge(e.dst, e.src, std::string());
-      } else {
-        db.put_edge(e.src, e.dst, std::string());
-      }
-    }
-    wait_for_background_work(db, opts, storage_dir, graph_tag, batch, total_batches);
 
+    // Ingest into out_db (forward edges only).
+#pragma omp parallel for num_threads(opts.num_threads) schedule(dynamic, 65536)
+    for (uint64_t i = 0; i < got; ++i) {
+      const auto& e = chunk[i];
+      out_db.put_edge(e.src, e.dst, std::string());
+    }
+    {
+      const double wait_begin = now_seconds();
+      out_db.AwaitWrite();
+      while (out_db.GetCompactionState()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+      }
+      std::printf("[ingest] graph=out batch=%zu/%zu background_wait=%.4f\n",
+                  batch_id + 1, total_batches, now_seconds() - wait_begin);
+    }
+
+    // Tally degrees serially after DB writes complete.
+    for (size_t i = 0; i < got; ++i) {
+      const auto& e = chunk[i];
+      if (e.src < graph.num_vertices) graph.out_degree[e.src]++;
+      if (e.dst < graph.num_vertices) graph.in_degree[e.dst]++;
+    }
+
+    cursor += got;
+    ++batch_id;
     const double batch_seconds = now_seconds() - batch_begin;
     const double elapsed = now_seconds() - ingest_begin;
-    const double edge_count = static_cast<double>(end - begin);
-    const double rate = batch_seconds > 0.0 ? edge_count / batch_seconds / 1e6 : 0.0;
-    const double progress = graph.edges.empty() ? 100.0 : (100.0 * static_cast<double>(end) / graph.edges.size());
-    std::printf("[ingest] graph=%s batch=%zu/%zu edges=[%zu,%zu) threads=%zu progress=%.2f%% batch_time=%.4f elapsed=%.4f rate=%.4fM edges/s\n",
-                graph_tag,
-                batch + 1,
-                total_batches,
-                begin,
-                end,
-                opts.num_threads,
-                progress,
-                batch_seconds,
-                elapsed,
-                rate);
+    const double rate = batch_seconds > 0.0 ? static_cast<double>(got) / batch_seconds / 1e6 : 0.0;
+    const double progress = total_edges == 0 ? 100.0
+                                              : 100.0 * static_cast<double>(cursor) /
+                                                    static_cast<double>(total_edges);
+    std::printf("[ingest] batch=%zu/%zu edges=%zu cursor=%zu threads=%zu progress=%.2f%% batch_time=%.4f elapsed=%.4f rate=%.4fM edges/s\n",
+                batch_id, total_batches, got, cursor, opts.num_threads,
+                progress, batch_seconds, elapsed, rate);
+
+    if (got < kStreamChunkEdges) break;  // EOF reached
+    if (opts.max_batch != 0 && batch_id >= opts.max_batch) {
+      std::printf("[ingest] reached --max-batch=%zu, stopping early\n", opts.max_batch);
+      break;
+    }
   }
+
+  std::fclose(fp);
+  return cursor;
 }
 
 void print_summary(const std::string& dataset_name,
@@ -345,23 +344,19 @@ int main(int argc, char** argv) {
     fs::create_directories(opts.storage_dir);
 
     const double load_begin = now_seconds();
-    std::printf("[load] reading bin32 graph\n");
-    lsmg_bench::LoadedGraph graph = load_bin32_graph(opts.input_path);
+    // Driver supplied num_vertices via --num-vertices, no input scan needed.
+    lsmg_bench::LoadedGraph graph = make_empty_loaded_graph(opts.num_vertices);
     const double load_seconds = now_seconds() - load_begin;
-    std::printf("[load] done vertices=%llu edges=%zu time=%.4f\n",
+    std::printf("[load] vertices=%llu (from --num-vertices) time=%.4f\n",
                 static_cast<unsigned long long>(graph.num_vertices),
-                graph.edges.size(),
                 load_seconds);
 
     lsmg::LSMGraph* out_db = open_graph(opts, storage_paths.out_storage_dir, graph.num_vertices, "out-graph");
-    lsmg::LSMGraph* in_db = open_graph(opts, storage_paths.in_storage_dir, graph.num_vertices, "in-graph");
 
     create_vertices(*out_db, graph.num_vertices, "out");
-    create_vertices(*in_db, graph.num_vertices, "in");
 
     const double ingest_begin = now_seconds();
-    ingest_single_graph(*out_db, graph, opts, storage_paths.out_storage_dir, false, "out");
-    ingest_single_graph(*in_db, graph, opts, storage_paths.in_storage_dir, true, "in");
+    const size_t total_ingested = stream_ingest_single(*out_db, graph, opts, storage_paths);
     const double ingest_seconds = now_seconds() - ingest_begin;
     const long rss_ingest = get_rss_bytes();
 
@@ -374,7 +369,7 @@ int main(int argc, char** argv) {
     config.pr_epsilon = opts.pr_epsilon;
 
     const lsmg_bench::BenchmarkResult result =
-        lsmg_bench::run_lsmgraph_graph_benchmarks_gapbs(*out_db, *in_db, graph, config);
+        lsmg_bench::run_lsmgraph_graph_benchmarks_gapbs(*out_db, graph, config);
     const double total_seconds = now_seconds() - bench_begin;
     print_summary(opts.dataset_name,
                   load_seconds,
@@ -382,10 +377,9 @@ int main(int argc, char** argv) {
                   rss_ingest,
                   result,
                   result.rss_bfs,
-                  graph.edges.size(),
+                  total_ingested,
                   total_seconds);
 
-    delete in_db;
     delete out_db;
     return 0;
   } catch (const std::exception& ex) {
