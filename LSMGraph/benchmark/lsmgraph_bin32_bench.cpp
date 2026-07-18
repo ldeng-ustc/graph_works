@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,6 +17,7 @@
 #include "common/flags.h"
 #include "graph_benchmarks.hpp"
 #include "lsmgraph.h"
+#include "../../../scatter_graph/script/query_bench.hpp"
 
 namespace fs = std::filesystem;
 
@@ -35,7 +37,9 @@ struct Options {
   size_t cc_neighbor_rounds = 2;
   double pr_epsilon = 0.0;
   bool reset = false;
+  bool skip_analytics = false;
   size_t max_batch = 0;  // 0 = no limit; otherwise stop after this many 16MiB batches
+  query_bench::QueryOptions query;
 };
 
 // Streaming chunk: 16 MiB (8 bytes per edge → 2M edges per chunk).
@@ -87,8 +91,15 @@ void print_usage(const char* argv0) {
                "  --cc-rounds <n>          CC rounds, default 10\n"
                "  --cc-neighbor-rounds <n> CC sampled neighbor rounds, default 2\n"
                "  --pr-epsilon <x>         PageRank early-stop epsilon, default 0\n"
+               "  --skip-analytics         Skip BFS/PR/CC after query phase\n"
                "  --reset                  Remove storage dir before ingest\n"
-               "  --max-batch <n>          Stop ingest after N 16MiB batches (0=no limit)\n",
+               "  --max-batch <n>          Stop ingest after N 16MiB batches (0=no limit)\n"
+               "  --query-pool-size <n>    Point-query vertex pool size, default 10000\n"
+               "  --query-uniform-count <n> Point-Uniform query count, default 1000000\n"
+               "  --query-skew-count <n>   Point-Skew query count, default 1000000\n"
+               "  --query-zipf-alpha <x>   Point-Skew Zipf alpha, default 1.2\n"
+               "  --query-pool-seed <n>    Query pool RNG seed, default 42\n"
+               "  --query-seed-base <n>    Query stream seed base, default 43\n",
                argv0);
 }
 
@@ -122,8 +133,22 @@ Options parse_options(int argc, char** argv) {
       opts.pr_epsilon = std::stod(require_value(arg, i, argc, argv));
     } else if (arg == "--reset") {
       opts.reset = true;
+    } else if (arg == "--skip-analytics") {
+      opts.skip_analytics = true;
     } else if (arg == "--max-batch") {
       opts.max_batch = std::stoull(require_value(arg, i, argc, argv));
+    } else if (arg == "--query-pool-size") {
+      opts.query.pool_size = std::stoull(require_value(arg, i, argc, argv));
+    } else if (arg == "--query-uniform-count") {
+      opts.query.uniform_count = std::stoull(require_value(arg, i, argc, argv));
+    } else if (arg == "--query-skew-count") {
+      opts.query.skew_count = std::stoull(require_value(arg, i, argc, argv));
+    } else if (arg == "--query-zipf-alpha") {
+      opts.query.zipf_alpha = std::stod(require_value(arg, i, argc, argv));
+    } else if (arg == "--query-pool-seed") {
+      opts.query.pool_seed = std::stoull(require_value(arg, i, argc, argv));
+    } else if (arg == "--query-seed-base") {
+      opts.query.seed_base = std::stoull(require_value(arg, i, argc, argv));
     } else if (arg == "-h" || arg == "--help") {
       print_usage(argv[0]);
       std::exit(0);
@@ -147,13 +172,14 @@ Options parse_options(int argc, char** argv) {
   if (opts.dataset_name.empty()) {
     opts.dataset_name = fs::path(opts.input_path).stem().string();
   }
+  opts.query.threads = opts.algo_threads;
   return opts;
 }
 
 void log_config(const Options& opts) {
   std::printf("[config] dataset=%s\n", opts.input_path.c_str());
   std::printf("[config] storage=%s\n", opts.storage_dir.c_str());
-  std::printf("[config] batch_size=%zu threads=%zu algo_threads=%zu bfs_rounds=%zu pr_iters=%zu pr_epsilon=%.6f cc_rounds=%zu cc_neighbor_rounds=%zu memtable_num=%zu\n",
+  std::printf("[config] batch_size=%zu threads=%zu algo_threads=%zu bfs_rounds=%zu pr_iters=%zu pr_epsilon=%.6f cc_rounds=%zu cc_neighbor_rounds=%zu memtable_num=%zu max_subcompactions=8\n",
               kDefaultIngestBatchEdges,
               opts.num_threads,
               opts.algo_threads,
@@ -190,6 +216,7 @@ void configure_lsmgraph_flags(const Options& opts, const std::string& storage_di
   FLAGS_dataset_name = opts.dataset_name;
   FLAGS_thread_num = static_cast<uint32_t>(opts.algo_threads);
   FLAGS_memtable_num = static_cast<uint32_t>(opts.memtable_num);
+  FLAGS_max_subcompactions = 8;
   FLAGS_mmap_path = (fs::path(storage_dir) / "mmap" / "block.mmap").string();
 }
 
@@ -263,15 +290,6 @@ size_t stream_ingest_single(lsmg::LSMGraph& out_db,
       const auto& e = chunk[i];
       out_db.put_edge(e.src, e.dst, std::string());
     }
-    {
-      const double wait_begin = now_seconds();
-      out_db.AwaitWrite();
-      while (out_db.GetCompactionState()) {
-        std::this_thread::sleep_for(std::chrono::microseconds(20));
-      }
-      std::printf("[ingest] graph=out batch=%zu/%zu background_wait=%.4f\n",
-                  batch_id + 1, total_batches, now_seconds() - wait_begin);
-    }
 
     // Tally degrees serially after DB writes complete.
     for (size_t i = 0; i < got; ++i) {
@@ -298,6 +316,14 @@ size_t stream_ingest_single(lsmg::LSMGraph& out_db,
       break;
     }
   }
+
+  const double wait_begin = now_seconds();
+  out_db.AwaitWrite();
+  while (out_db.GetCompactionState()) {
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
+  std::printf("[ingest] graph=out final_background_wait=%.4f\n",
+              now_seconds() - wait_begin);
 
   std::fclose(fp);
   return cursor;
@@ -360,6 +386,18 @@ int main(int argc, char** argv) {
     const double ingest_seconds = now_seconds() - ingest_begin;
     const long rss_ingest = get_rss_bytes();
 
+    lsmg_bench::LSMGraphNeighborOracle query_oracle(*out_db);
+    auto query_walker = [&](uint32_t v) -> uint64_t {
+      uint64_t degree = 0;
+      query_oracle.for_out_neighbors(static_cast<size_t>(omp_get_thread_num()), v,
+                                     [&](uint32_t /*dst*/) {
+                                       ++degree;
+                                       return true;
+                                     });
+      return degree;
+    };
+    query_bench::run_query_phase(graph.num_vertices, query_walker, opts.query, std::cout);
+
     lsmg_bench::BenchmarkConfig config;
     config.algo_threads = opts.algo_threads;
     config.bfs_rounds = opts.bfs_rounds;
@@ -368,8 +406,10 @@ int main(int argc, char** argv) {
     config.cc_neighbor_rounds = opts.cc_neighbor_rounds;
     config.pr_epsilon = opts.pr_epsilon;
 
-    const lsmg_bench::BenchmarkResult result =
-        lsmg_bench::run_lsmgraph_graph_benchmarks_gapbs(*out_db, graph, config);
+    lsmg_bench::BenchmarkResult result;
+    if (!opts.skip_analytics) {
+      result = lsmg_bench::run_lsmgraph_graph_benchmarks_gapbs(*out_db, graph, config);
+    }
     const double total_seconds = now_seconds() - bench_begin;
     print_summary(opts.dataset_name,
                   load_seconds,
@@ -380,7 +420,15 @@ int main(int argc, char** argv) {
                   total_ingested,
                   total_seconds);
 
-    delete out_db;
+    // LSMGraph's destructor occasionally segfaults while persisting metadata
+    // after large streaming runs (observed on Protein after all benchmark
+    // metrics had already been printed).  E1.1/E1.2 only needs the completed
+    // ingest+query measurements and the driver removes the storage directory
+    // after recording disk footprint, so avoid destructor teardown in the
+    // skip-analytics phase.  The OS will reclaim mappings/files on process exit.
+    if (!opts.skip_analytics) {
+      delete out_db;
+    }
     return 0;
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "error: %s\n", ex.what());

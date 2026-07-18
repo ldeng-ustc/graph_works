@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "livegraph.hpp"
+#include "../../../scatter_graph/script/query_bench.hpp"
 
 namespace fs = std::filesystem;
 
@@ -51,7 +52,9 @@ struct Options {
     size_t cc_neighbor_rounds = 2;
     int64_t debug_vertex = -1;
     bool reset = false;
+    bool skip_analytics = false;
     size_t max_batch = 0;  // 0 = no limit; otherwise stop after this many 16MiB batches
+    query_bench::QueryOptions query;
 };
 
 struct LoadedGraph {
@@ -78,8 +81,15 @@ void print_usage(const char* argv0) {
         << "  --cc-rounds <n>       CC rounds, default 10\n"
         << "  --cc-neighbor-rounds <n>  CC sampled neighbor rounds, default 2\n"
         << "  --debug-vertex <id>   Print out/in neighbors for one vertex and exit after ingest\n"
+        << "  --skip-analytics      Skip BFS/PR/CC after query phase\n"
         << "  --reset               Remove existing storage dir before ingest\n"
-        << "  --max-batch <n>       Stop ingest after N 16MiB batches (0=no limit)\n";
+        << "  --max-batch <n>       Stop ingest after N 16MiB batches (0=no limit)\n"
+        << "  --query-pool-size <n> Point-query vertex pool size, default 10000\n"
+        << "  --query-uniform-count <n> Point-Uniform query count, default 1000000\n"
+        << "  --query-skew-count <n> Point-Skew query count, default 1000000\n"
+        << "  --query-zipf-alpha <x> Point-Skew Zipf alpha, default 1.2\n"
+        << "  --query-pool-seed <n> Query pool RNG seed, default 42\n"
+        << "  --query-seed-base <n> Query stream seed base, default 43\n";
 }
 
 Options parse_args(int argc, char* argv[]) {
@@ -119,8 +129,22 @@ Options parse_args(int argc, char* argv[]) {
             opts.debug_vertex = std::stoll(require_value("--debug-vertex"));
         } else if (arg == "--reset") {
             opts.reset = true;
+        } else if (arg == "--skip-analytics") {
+            opts.skip_analytics = true;
         } else if (arg == "--max-batch") {
             opts.max_batch = std::stoull(require_value("--max-batch"));
+        } else if (arg == "--query-pool-size") {
+            opts.query.pool_size = std::stoull(require_value("--query-pool-size"));
+        } else if (arg == "--query-uniform-count") {
+            opts.query.uniform_count = std::stoull(require_value("--query-uniform-count"));
+        } else if (arg == "--query-skew-count") {
+            opts.query.skew_count = std::stoull(require_value("--query-skew-count"));
+        } else if (arg == "--query-zipf-alpha") {
+            opts.query.zipf_alpha = std::stod(require_value("--query-zipf-alpha"));
+        } else if (arg == "--query-pool-seed") {
+            opts.query.pool_seed = std::stoull(require_value("--query-pool-seed"));
+        } else if (arg == "--query-seed-base") {
+            opts.query.seed_base = std::stoull(require_value("--query-seed-base"));
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             std::exit(0);
@@ -138,6 +162,7 @@ Options parse_args(int argc, char* argv[]) {
     if (opts.algo_threads == 0) {
         opts.algo_threads = opts.num_threads;
     }
+    opts.query.threads = opts.algo_threads;
     return opts;
 }
 
@@ -454,8 +479,24 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
-        const LiveGraphBenchmarkResult result = run_livegraph_graph_benchmarks_gapbs(
-            graph, loaded, make_benchmark_config(opts));
+        auto make_query_walker = [&graph]() {
+            return [tx = graph.begin_read_only_transaction()](uint32_t v) mutable -> uint64_t {
+                auto it = tx.get_edges(v, 0);
+                uint64_t degree = 0;
+                while (it.valid()) {
+                    ++degree;
+                    it.next();
+                }
+                return degree;
+            };
+        };
+        query_bench::run_query_phase_thread_local(
+            loaded.num_vertices, make_query_walker, opts.query, std::cout);
+
+        LiveGraphBenchmarkResult result;
+        if (!opts.skip_analytics) {
+            result = run_livegraph_graph_benchmarks_gapbs(graph, loaded, make_benchmark_config(opts));
+        }
         const double total_seconds = seconds_since(bench_begin);
         print_summary(
             load_seconds, ingest_seconds, rss_ingest, result, loaded.total_edges, total_seconds);

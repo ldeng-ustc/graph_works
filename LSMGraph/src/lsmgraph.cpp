@@ -1235,7 +1235,7 @@ void LSMGraph::check_vertex_id(VertexId_t vertex_id) {
 // open
 void LSMGraph::open(const std::string &dir, size_t max_vertex_num, LSMGraph **db) {
   max_vertex_num += 10;
-  *db = new LSMGraph(dir, max_vertex_num, 1, FLAGS_memtable_num);
+  *db = new LSMGraph(dir, max_vertex_num, static_cast<int>(FLAGS_thread_num), FLAGS_memtable_num);
 }
 
 void LSMGraph::valid_index(uint max_vertex_id) {
