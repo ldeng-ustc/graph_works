@@ -34,13 +34,12 @@ namespace BACH
 		{
 			compact_thread.push_back(std::make_shared<std::thread>(
 				[&] {CompactLoop(); }));
-			compact_thread[i]->detach();
 		}
 		read_version = current_version = new Version(this);	
 	}
 	DB::~DB()
 	{
-		close = true;
+		close.store(true, std::memory_order_release);
 		Files->CompactionCV.notify_all();
 		for(auto &i: compact_thread)
 			if (i->joinable())
@@ -77,15 +76,21 @@ namespace BACH
 		Memtable->AddEdgeLabel(std::get<1>(x), std::get<2>(x));
 		return std::get<0>(x);
 	}
+	void DB::WaitForBackgroundWork()
+	{
+		std::unique_lock<std::mutex> lock(Files->CompactionCVMutex);
+		Files->CompactionCV.notify_all();
+		Files->CompactionCV.wait(lock, [this] {
+			return Files->CompactionList.empty() &&
+				working_compact_thread.load(std::memory_order_acquire) == 0;
+		});
+	}
 	void DB::CompactAll(double_t ratio)
 	{
 		if(options->MERGING_STRATEGY != Options::MergingStrategy::LEVELING)
 			return;
 		//Memtable->PersistenceAll();
-		while (working_compact_thread.load() > 0 || !Files->CompactionList.empty())
-		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		}
+		WaitForBackgroundWork();
 		for (idx_t level = 0; level < options->MAX_LEVEL - 1; level++)
 		{
 			auto v = current_version;
@@ -118,7 +123,7 @@ namespace BACH
 							j[k]->merging = true;
 							x.file_list.push_back(j[k]);
 						}
-						Files->CompactionList.push(x);
+						Files->AddCompaction(x);
 						last = idx;
 					}
 				for(; idx < j.size() - 1 && j[idx]->vertex_id_b == j[idx + 1]->vertex_id_b; idx++);
@@ -134,14 +139,11 @@ namespace BACH
 						j[k]->merging = true;
 						x.file_list.push_back(j[k]);
 					}
-					Files->CompactionList.push(x);
+					Files->AddCompaction(x);
 				}
 			}
 			Files->CompactionCV.notify_all();
-			while (working_compact_thread.load() > 0 || !Files->CompactionList.empty())
-			{
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			}
+			WaitForBackgroundWork();
 		}
 		auto v = current_version;
 		for(auto &i: v->FileIndex)
@@ -164,7 +166,7 @@ namespace BACH
 									j[k]->merging = true;
 									x.file_list.push_back(j[k]);
 								}
-								Files->CompactionList.push(x);
+								Files->AddCompaction(x);
 							}
 							last = idx;
 						}
@@ -180,22 +182,21 @@ namespace BACH
 							j[k]->merging = true;
 							x.file_list.push_back(j[k]);
 						}
-						Files->CompactionList.push(x);
+						Files->AddCompaction(x);
 					}
 				}
 		Files->CompactionCV.notify_all();
-		while (working_compact_thread.load() > 0 || !Files->CompactionList.empty())
-		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		}
+		WaitForBackgroundWork();
 	}
 	void DB::CompactLoop()
 	{
 		while (true)
 		{
-			if (close)
+			if (close.load(std::memory_order_acquire))
 				return;
 			std::unique_lock <std::mutex> lock(Files->CompactionCVMutex);
+			if (close.load(std::memory_order_acquire))
+				return;
 			if (!Files->CompactionList.empty())
 			{
 				working_compact_thread.fetch_add(1, std::memory_order_relaxed);
@@ -262,12 +263,19 @@ namespace BACH
 				}
 				ProgressVersion(edit, time, x.Persistence, type == 1);
 				delete edit;
-				working_compact_thread.fetch_add(-1, std::memory_order_relaxed);
 				ProgressReadVersion();
+				{
+					std::lock_guard<std::mutex> done_lock(Files->CompactionCVMutex);
+					working_compact_thread.fetch_add(-1, std::memory_order_release);
+				}
+				Files->CompactionCV.notify_all();
 			}
 			else
 			{
-				Files->CompactionCV.wait_for(lock, std::chrono::milliseconds(200));
+				Files->CompactionCV.wait_for(lock, std::chrono::milliseconds(200), [this] {
+					return close.load(std::memory_order_acquire) ||
+						!Files->CompactionList.empty();
+				});
 				//ProgressReadVersion();
 			}
 		}

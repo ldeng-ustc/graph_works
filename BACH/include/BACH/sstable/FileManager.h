@@ -37,6 +37,7 @@ namespace BACH
 		std::mutex CompactionCVMutex;
 		std::condition_variable CompactionCV;
 		std::queue<Compaction> CompactionList;
+		std::mutex FileNumListMutex;
 		std::vector<      //label
 			std::vector<  //level
 			std::vector<  //src_b

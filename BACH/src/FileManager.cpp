@@ -112,6 +112,7 @@ namespace BACH {
 	idx_t FileManager::GetFileID(
 		label_t label, idx_t level, vertex_t src_b)
 	{
+		std::lock_guard<std::mutex> lock(FileNumListMutex);
 		auto x = src_b / util::ClacFileSize(db->options, level);
 		if (FileNumList.size() <= label)
 			FileNumList.resize(label + 1);

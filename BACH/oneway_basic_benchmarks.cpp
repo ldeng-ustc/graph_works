@@ -270,6 +270,10 @@ size_t ingest_edges(BACH::DB& db,
     }
   }
   std::fclose(input);
+  const double background_wait_begin = now_seconds();
+  db.WaitForBackgroundWork();
+  std::printf("[ingest] direction=oneway final_background_wait=%.4f\n",
+              now_seconds() - background_wait_begin);
   graph.total_edges = loaded_edges;
   return loaded_edges;
 }

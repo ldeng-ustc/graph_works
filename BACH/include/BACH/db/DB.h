@@ -27,6 +27,8 @@ namespace BACH
 		//return the id of new elabel
 		label_t AddEdgeLabel(std::string edge_label_name,
 			std::string src_label_name, std::string dst_label_name);
+		//wait until all queued persistence and compaction work is complete
+		void WaitForBackgroundWork();
 		//compact all edge
 		void CompactAll(double_t ratio = 0.0);
 		void ProgressVersion(VersionEdit* edit, time_t time,
@@ -49,7 +51,7 @@ namespace BACH
 		std::vector<std::shared_ptr<std::thread>> compact_thread;
 		std::atomic<size_t> working_compact_thread = 0;
 		std::atomic<bool> progressing_read_version = false;
-		bool close = false;
+		std::atomic<bool> close = false;
 		//compaction loop for background thread
 		void CompactLoop();
 		void ProgressReadVersion();
