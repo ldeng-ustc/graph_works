@@ -79,6 +79,11 @@ target_include_directories(bach_bin32_bench PRIVATE include)
 target_compile_features(bach_bin32_bench PRIVATE cxx_std_20)
 target_link_libraries(bach_bin32_bench PRIVATE bach OpenMP::OpenMP_CXX)
 
+add_executable(bach_oneway_basic_benchmarks oneway_basic_benchmarks.cpp)
+target_include_directories(bach_oneway_basic_benchmarks PRIVATE include)
+target_compile_features(bach_oneway_basic_benchmarks PRIVATE cxx_std_20)
+target_link_libraries(bach_oneway_basic_benchmarks PRIVATE bach OpenMP::OpenMP_CXX)
+
 set(DEBUG OFF)
 
 set(CMAKE_CXX_FLAGS "-O3 ${CMAKE_CXX_FLAGS}")
