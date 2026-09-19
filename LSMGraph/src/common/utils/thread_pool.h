@@ -16,6 +16,7 @@ class ThreadPool {
   ThreadPool(size_t);
   template <class F, class... Args>
   auto enqueue(F &&f, Args &&...args) -> std::future<typename std::result_of<F(Args...)>::type>;
+  void wait_idle();
   ~ThreadPool();
 
  protected:
@@ -29,12 +30,15 @@ class ThreadPool {
   // synchronization
   std::mutex              queue_mutex;
   std::condition_variable condition;
+  std::condition_variable idle_condition;
+  size_t                  active_tasks;
   bool                    stop;
 };
 
 // the constructor just launches some amount of workers
 inline ThreadPool::ThreadPool(size_t threads)
-    : stop(false) {
+    : active_tasks(0)
+    , stop(false) {
   for (size_t i = 0; i < threads; ++i)
     workers.emplace_back([this] {
       for (;;) {
@@ -46,9 +50,18 @@ inline ThreadPool::ThreadPool(size_t threads)
           if (this->stop && this->tasks.empty()) return;
           task = std::move(this->tasks.front());
           this->tasks.pop();
+          ++this->active_tasks;
         }
 
         task();
+
+        {
+          std::unique_lock<std::mutex> lock(this->queue_mutex);
+          --this->active_tasks;
+          if (this->tasks.empty() && this->active_tasks == 0) {
+            this->idle_condition.notify_all();
+          }
+        }
       }
     });
 }
@@ -72,6 +85,13 @@ auto ThreadPool::enqueue(F &&f, Args &&...args) -> std::future<typename std::res
   }
   condition.notify_one();
   return res;
+}
+
+inline void ThreadPool::wait_idle() {
+  std::unique_lock<std::mutex> lock(queue_mutex);
+  idle_condition.wait(lock, [this] {
+    return tasks.empty() && active_tasks == 0;
+  });
 }
 
 // the destructor joins all threads

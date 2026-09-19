@@ -80,10 +80,10 @@ struct BenchmarkResult {
   size_t cc_components = 0;
 };
 
-// Single-directed neighbor oracle: only forward (out) edges available.
 class LSMGraphNeighborOracle {
  public:
-  explicit LSMGraphNeighborOracle(lsmg::LSMGraph& out_db) : out_db_(out_db) {}
+  LSMGraphNeighborOracle(lsmg::LSMGraph& out_db, lsmg::LSMGraph& in_db)
+      : out_db_(out_db), in_db_(in_db) {}
 
   template <typename Fn>
   void for_out_neighbors(size_t tid, uint32_t src, Fn&& fn) const {
@@ -96,65 +96,99 @@ class LSMGraphNeighborOracle {
     }
   }
 
+  template <typename Fn>
+  void for_in_neighbors(size_t tid, uint32_t dst, Fn&& fn) const {
+    (void)tid;
+    auto it = in_db_.get_edges(dst);
+    for (; it.valid(); it.next()) {
+      if (!fn(static_cast<uint32_t>(it.dst_id()))) {
+        break;
+      }
+    }
+  }
+
  private:
   lsmg::LSMGraph& out_db_;
+  lsmg::LSMGraph& in_db_;
 };
 
 inline bool compare_and_swap(uint32_t& x, uint32_t old_val, uint32_t new_val) {
   return __sync_bool_compare_and_swap(&x, old_val, new_val);
 }
 
-// Push-based top-down BFS using only out-edges.
-template <typename ForOutNeighbors>
-size_t run_push_bfs(uint32_t num_vertices,
-                    uint32_t source,
-                    size_t num_threads,
-                    ForOutNeighbors&& for_out_neighbors) {
+template <typename ForOutNeighbors, typename ForInNeighbors>
+size_t run_gapbs_bfs(uint32_t num_vertices,
+                     uint32_t source,
+                     size_t num_threads,
+                     ForOutNeighbors&& for_out_neighbors,
+                     ForInNeighbors&& for_in_neighbors) {
   if (num_vertices == 0) {
     return 0;
   }
 
   std::vector<uint32_t> status(num_vertices, 0);
   uint32_t level = 1;
+  bool top_down = true;
   size_t frontier = 0;
   size_t visited_count = 1;
   status[source] = level;
 
   do {
     frontier = 0;
+    const char* mode = top_down ? "top-down" : "bottom-up";
     const int threads = static_cast<int>(clamp_thread_count(num_threads, num_vertices));
+    if (top_down) {
 #pragma omp parallel for num_threads(threads) schedule(dynamic, 16384) reduction(+ : frontier)
-    for (int64_t v = 0; v < static_cast<int64_t>(num_vertices); ++v) {
-      if (status[static_cast<size_t>(v)] != level) {
-        continue;
-      }
-      const size_t tid = static_cast<size_t>(omp_get_thread_num());
-      for_out_neighbors(tid, static_cast<uint32_t>(v), [&](uint32_t dst) {
-        if (dst < num_vertices && compare_and_swap(status[static_cast<size_t>(dst)], 0, level + 1)) {
-          ++frontier;
+      for (int64_t v = 0; v < static_cast<int64_t>(num_vertices); ++v) {
+        if (status[static_cast<size_t>(v)] != level) {
+          continue;
         }
-        return true;
-      });
+        const size_t tid = static_cast<size_t>(omp_get_thread_num());
+        for_out_neighbors(tid, static_cast<uint32_t>(v), [&](uint32_t dst) {
+          if (dst < num_vertices && compare_and_swap(status[static_cast<size_t>(dst)], 0, level + 1)) {
+            ++frontier;
+          }
+          return true;
+        });
+      }
+    } else {
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 16384) reduction(+ : frontier)
+      for (int64_t v = 0; v < static_cast<int64_t>(num_vertices); ++v) {
+        if (status[static_cast<size_t>(v)] != 0) {
+          continue;
+        }
+        const size_t tid = static_cast<size_t>(omp_get_thread_num());
+        for_in_neighbors(tid, static_cast<uint32_t>(v), [&](uint32_t src) {
+          if (src < num_vertices &&
+              status[static_cast<size_t>(src)] == level &&
+              compare_and_swap(status[static_cast<size_t>(v)], 0, level + 1)) {
+            ++frontier;
+            return false;
+          }
+          return status[static_cast<size_t>(v)] == 0;
+        });
+      }
     }
     visited_count += frontier;
-    std::printf("[bfs] level=%u mode=push new_frontier=%zu visited=%zu\n",
+    std::printf("[bfs] level=%u mode=%s new_frontier=%zu visited=%zu\n",
                 level,
+                mode,
                 frontier,
                 visited_count);
+    top_down = !(frontier >= static_cast<size_t>(0.002 * static_cast<double>(num_vertices)));
     ++level;
   } while (frontier);
 
   return visited_count;
 }
 
-// Push-based PageRank using only out-edges. Uses omp atomic for accumulation.
-template <typename ForOutNeighbors>
-double run_push_pr(uint32_t num_vertices,
-                   const std::vector<uint32_t>& out_degree,
-                   size_t num_threads,
-                   size_t iterations,
-                   double epsilon,
-                   ForOutNeighbors&& for_out_neighbors) {
+template <typename ForInNeighbors>
+double run_gapbs_pr(uint32_t num_vertices,
+                    const std::vector<uint32_t>& out_degree,
+                    size_t num_threads,
+                    size_t iterations,
+                    double epsilon,
+                    ForInNeighbors&& for_in_neighbors) {
   if (num_vertices == 0) {
     return 0.0;
   }
@@ -166,44 +200,37 @@ double run_push_pr(uint32_t num_vertices,
 
   std::vector<ScoreT> scores(num_vertices, init_score);
   std::vector<ScoreT> outgoing_contrib(num_vertices, 0.0f);
-  std::vector<ScoreT> incoming_total(num_vertices, 0.0f);
   const int threads = static_cast<int>(clamp_thread_count(num_threads, num_vertices));
+#pragma omp parallel for num_threads(threads) schedule(static)
+  for (int64_t n = 0; n < static_cast<int64_t>(num_vertices); ++n) {
+    outgoing_contrib[static_cast<size_t>(n)] =
+        out_degree[static_cast<size_t>(n)] == 0
+            ? 0.0f
+            : init_score / static_cast<ScoreT>(out_degree[static_cast<size_t>(n)]);
+  }
 
   for (size_t iter = 0; iter < iterations; ++iter) {
     const auto iter_begin = std::chrono::steady_clock::now();
-
-#pragma omp parallel for num_threads(threads) schedule(static)
-    for (int64_t v = 0; v < static_cast<int64_t>(num_vertices); ++v) {
-      const auto deg = out_degree[static_cast<size_t>(v)];
-      outgoing_contrib[static_cast<size_t>(v)] =
-          deg == 0 ? 0.0f : scores[static_cast<size_t>(v)] / static_cast<ScoreT>(deg);
-      incoming_total[static_cast<size_t>(v)] = 0.0f;
-    }
-
-    // Push: scatter contribution along out-edges into incoming_total[dst].
-#pragma omp parallel for num_threads(threads) schedule(dynamic, 16384)
-    for (int64_t v = 0; v < static_cast<int64_t>(num_vertices); ++v) {
-      const ScoreT contrib = outgoing_contrib[static_cast<size_t>(v)];
-      if (contrib == 0.0f) {
-        continue;
-      }
+    std::vector<ScoreT> prev_outgoing_contrib = outgoing_contrib;
+    double error = 0.0;
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 16384) reduction(+ : error)
+    for (int64_t u = 0; u < static_cast<int64_t>(num_vertices); ++u) {
+      ScoreT incoming_total = 0.0f;
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
-      for_out_neighbors(tid, static_cast<uint32_t>(v), [&](uint32_t dst) {
-        if (dst < num_vertices) {
-#pragma omp atomic
-          incoming_total[static_cast<size_t>(dst)] += contrib;
+      for_in_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t src) {
+        if (src < num_vertices) {
+          incoming_total += prev_outgoing_contrib[static_cast<size_t>(src)];
         }
         return true;
       });
-    }
-
-    double error = 0.0;
-#pragma omp parallel for num_threads(threads) schedule(static) reduction(+ : error)
-    for (int64_t u = 0; u < static_cast<int64_t>(num_vertices); ++u) {
       const ScoreT old_score = scores[static_cast<size_t>(u)];
-      const ScoreT new_score = base_score + kDamp * incoming_total[static_cast<size_t>(u)];
+      const ScoreT new_score = base_score + kDamp * incoming_total;
       scores[static_cast<size_t>(u)] = new_score;
       error += std::fabs(new_score - old_score);
+      outgoing_contrib[static_cast<size_t>(u)] =
+          out_degree[static_cast<size_t>(u)] == 0
+              ? 0.0f
+              : new_score / static_cast<ScoreT>(out_degree[static_cast<size_t>(u)]);
     }
 
     if (error < epsilon) {
@@ -310,12 +337,12 @@ inline void print_component_stats(const uint32_t* comp, uint32_t num_vertices) {
   std::printf("[cc] components=%zu\n", count.size());
 }
 
-// Connected components via parallel union-find over out-edges only.
-// (Treats the directed graph as undirected by linking on every observed forward edge.)
-template <typename ForOutNeighbors>
-size_t run_push_cc(uint32_t num_vertices,
-                   size_t num_threads,
-                   ForOutNeighbors&& for_out_neighbors) {
+template <typename ForOutNeighbors, typename ForInNeighbors>
+size_t run_gapbs_cc(uint32_t num_vertices,
+                    size_t neighbor_rounds,
+                    size_t num_threads,
+                    ForOutNeighbors&& for_out_neighbors,
+                    ForInNeighbors&& for_in_neighbors) {
   if (num_vertices == 0) {
     return 0;
   }
@@ -327,22 +354,52 @@ size_t run_push_cc(uint32_t num_vertices,
     comp[static_cast<size_t>(v)] = static_cast<uint32_t>(v);
   }
 
-  const auto link_begin = std::chrono::steady_clock::now();
+  const auto sample_begin = std::chrono::steady_clock::now();
 #pragma omp parallel for num_threads(threads) schedule(dynamic, 16384)
   for (int64_t u = 0; u < static_cast<int64_t>(num_vertices); ++u) {
+    size_t d = 0;
     const size_t tid = static_cast<size_t>(omp_get_thread_num());
     for_out_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
+      if (d < neighbor_rounds && v < num_vertices) {
+        link_components(static_cast<uint32_t>(u), v, comp.data());
+        ++d;
+        return d < neighbor_rounds;
+      }
+      return false;
+    });
+  }
+  compress_components(num_vertices, comp.data(), num_threads);
+
+  const uint32_t largest_component = sample_frequent_element(comp.data(), num_vertices);
+  std::printf("[cc] sample+compress time=%.4f largest_component=%u\n",
+              seconds_since(sample_begin),
+              largest_component);
+  const auto final_begin = std::chrono::steady_clock::now();
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 16384)
+  for (int64_t u = 0; u < static_cast<int64_t>(num_vertices); ++u) {
+    if (comp[static_cast<size_t>(u)] == largest_component) {
+      continue;
+    }
+
+    size_t d = 0;
+    const size_t tid = static_cast<size_t>(omp_get_thread_num());
+    for_out_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
+      if (d >= neighbor_rounds && v < num_vertices) {
+        link_components(static_cast<uint32_t>(u), v, comp.data());
+      }
+      ++d;
+      return true;
+    });
+
+    for_in_neighbors(tid, static_cast<uint32_t>(u), [&](uint32_t v) {
       if (v < num_vertices) {
         link_components(static_cast<uint32_t>(u), v, comp.data());
       }
       return true;
     });
   }
-  std::printf("[cc] union-find link time=%.4f\n", seconds_since(link_begin));
-
-  const auto compress_begin = std::chrono::steady_clock::now();
   compress_components(num_vertices, comp.data(), num_threads);
-  std::printf("[cc] compress time=%.4f\n", seconds_since(compress_begin));
+  std::printf("[cc] final-link+compress time=%.4f\n", seconds_since(final_begin));
   print_component_stats(comp.data(), num_vertices);
 
   size_t components = 0;
@@ -355,20 +412,22 @@ size_t run_push_cc(uint32_t num_vertices,
 }
 
 inline BenchmarkResult run_lsmgraph_graph_benchmarks_gapbs(lsmg::LSMGraph& out_db,
+                                                           lsmg::LSMGraph& in_db,
                                                            const LoadedGraph& loaded,
                                                            const BenchmarkConfig& config) {
   BenchmarkResult result;
-  LSMGraphNeighborOracle oracle(out_db);
+  LSMGraphNeighborOracle oracle(out_db, in_db);
 
   for (size_t round = 0; round < config.bfs_rounds; ++round) {
     const uint32_t source = loaded.num_vertices == 0 ? 0 : static_cast<uint32_t>(round % loaded.num_vertices);
     const auto round_begin = std::chrono::steady_clock::now();
     std::printf("[bfs] round=%zu source=%u start\n", round, source);
-    const size_t visited = run_push_bfs(
+    const size_t visited = run_gapbs_bfs(
         loaded.num_vertices,
         source,
         config.algo_threads,
-        [&](size_t tid, uint32_t src, auto&& fn) { oracle.for_out_neighbors(tid, src, fn); });
+        [&](size_t tid, uint32_t src, auto&& fn) { oracle.for_out_neighbors(tid, src, fn); },
+        [&](size_t tid, uint32_t dst, auto&& fn) { oracle.for_in_neighbors(tid, dst, fn); });
     result.bfs_checksum += visited;
     const double round_seconds = seconds_since(round_begin);
     result.bfs_seconds += round_seconds;
@@ -382,24 +441,26 @@ inline BenchmarkResult run_lsmgraph_graph_benchmarks_gapbs(lsmg::LSMGraph& out_d
 
   const auto pr_begin = std::chrono::steady_clock::now();
   std::printf("[pr] start iterations=%zu epsilon=%.6f\n", config.pr_iterations, config.pr_epsilon);
-  result.pr_sum = run_push_pr(
+  result.pr_sum = run_gapbs_pr(
       loaded.num_vertices,
       loaded.out_degree,
       config.algo_threads,
       config.pr_iterations,
       config.pr_epsilon,
-      [&](size_t tid, uint32_t src, auto&& fn) { oracle.for_out_neighbors(tid, src, fn); });
+      [&](size_t tid, uint32_t dst, auto&& fn) { oracle.for_in_neighbors(tid, dst, fn); });
   result.pr_seconds = seconds_since(pr_begin);
   std::printf("[pr] done sum=%.8f time=%.4f\n", result.pr_sum, result.pr_seconds);
 
   const auto cc_begin = std::chrono::steady_clock::now();
   for (size_t round = 0; round < config.cc_rounds; ++round) {
     const auto round_begin = std::chrono::steady_clock::now();
-    std::printf("[cc] round=%zu start (union-find on out-edges)\n", round);
-    result.cc_components = run_push_cc(
+    std::printf("[cc] round=%zu start neighbor_rounds=%zu\n", round, config.cc_neighbor_rounds);
+    result.cc_components = run_gapbs_cc(
         loaded.num_vertices,
+        config.cc_neighbor_rounds,
         config.algo_threads,
-        [&](size_t tid, uint32_t src, auto&& fn) { oracle.for_out_neighbors(tid, src, fn); });
+        [&](size_t tid, uint32_t src, auto&& fn) { oracle.for_out_neighbors(tid, src, fn); },
+        [&](size_t tid, uint32_t dst, auto&& fn) { oracle.for_in_neighbors(tid, dst, fn); });
     std::printf("[cc] round=%zu done components=%zu time=%.4f\n",
                 round,
                 result.cc_components,

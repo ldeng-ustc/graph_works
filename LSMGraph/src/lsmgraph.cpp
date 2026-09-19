@@ -200,8 +200,16 @@ LSMGraph::~LSMGraph() {
     outFile.close();
   }
 
-  for (auto it1 = fileMetaCache.begin(); it1 != fileMetaCache.end(); ++it1) {
-    for (auto it2 = (*it1)->begin(); it2 != (*it1)->end(); ++it2) delete (*it2);
+  {
+    std::unique_lock w_lock(sv_.vm_rw_mtx);
+    sv_.version_memtable.reset();
+  }
+
+  for (auto file_meta_level : fileMetaCache) {
+    for (auto file_meta : *file_meta_level) {
+      delete file_meta;
+    }
+    file_meta_level->clear();
   }
 
   for (auto tb : memTable_list_) {
@@ -213,7 +221,6 @@ LSMGraph::~LSMGraph() {
     delete f_handle.second;
   }
 
-  sv_.~SuperVersion();
   delete l0_versionset_;
 
   auto futex_allocater = std::allocator_traits<decltype(array_allocator)>::rebind_alloc<Futex>(array_allocator);
@@ -1235,7 +1242,7 @@ void LSMGraph::check_vertex_id(VertexId_t vertex_id) {
 // open
 void LSMGraph::open(const std::string &dir, size_t max_vertex_num, LSMGraph **db) {
   max_vertex_num += 10;
-  *db = new LSMGraph(dir, max_vertex_num, static_cast<int>(FLAGS_thread_num), FLAGS_memtable_num);
+  *db = new LSMGraph(dir, max_vertex_num, 1, FLAGS_memtable_num);
 }
 
 void LSMGraph::valid_index(uint max_vertex_id) {
@@ -1491,6 +1498,13 @@ void LSMGraph::AwaitWrite() {
       }
       asm volatile("pause");
     }
+  }
+}
+
+void LSMGraph::WaitForBackgroundWork() {
+  worker_pool.wait_idle();
+  while (GetCompactionState()) {
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
   }
 }
 

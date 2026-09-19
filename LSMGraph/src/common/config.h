@@ -64,7 +64,14 @@ constexpr uint64_t BLOOM_FILTER_SIZE = (26150110 / 8);
 constexpr uint64_t BLOOM_FILTER_SIZE = 1024;
 #endif
 
+#ifdef LSMG_VSPARSITY_NO_FLUSH
+// 顶点稀疏性 bench 专用：把 memtable 容量抬到能装下全部边，让 ingest 全程留在
+// 内存里不触发 flush，从而测出纯内存载入时间。只在带该宏的独立 build 生效，
+// 默认 build（含 E4 与常规 benchmark）保持 64MB 原值不受影响。
+constexpr uint64_t   MAX_TABLE_SIZE             = ((uint64_t)2 << 30);
+#else
 constexpr uint64_t   MAX_TABLE_SIZE             = (64 * (1 << 20) / 1);
+#endif
 const size_t         PROPERTY_BUFFER_SIZE       = (4 * (1 << 20));
 const size_t         MAX_EFILE_SiZE             = 64 * (1 << 20) / 1;
 const int            LEVEL_FILE_RATIO           = 10;

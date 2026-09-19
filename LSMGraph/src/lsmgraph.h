@@ -176,6 +176,8 @@ class LSMGraph {
 
   void AwaitWrite();
 
+  void WaitForBackgroundWork();
+
   bool CheckState() const;
 };
 

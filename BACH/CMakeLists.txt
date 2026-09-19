@@ -84,6 +84,15 @@ target_include_directories(bach_oneway_basic_benchmarks PRIVATE include)
 target_compile_features(bach_oneway_basic_benchmarks PRIVATE cxx_std_20)
 target_link_libraries(bach_oneway_basic_benchmarks PRIVATE bach OpenMP::OpenMP_CXX)
 
+# 顶点稀疏性实验（M1）的独立 bench，不影响上面已有的可执行文件。
+# related_works 是指向 graph_works 的软链接，这里用绝对路径引用生成器与共享头。
+set(VSPARSITY_DIR /home/denglong.1997/scatter_graph/related_works/vertex_sparsity)
+set(GENERATOR_DIR /home/denglong.1997/scatter_graph/generator)
+add_executable(bach_vsparsity ${VSPARSITY_DIR}/bach_vsparsity.cc)
+target_include_directories(bach_vsparsity PRIVATE include ${VSPARSITY_DIR} ${GENERATOR_DIR})
+target_compile_features(bach_vsparsity PRIVATE cxx_std_20)
+target_link_libraries(bach_vsparsity PRIVATE bach ${VSPARSITY_DIR}/libkrongen.a OpenMP::OpenMP_CXX)
+
 set(DEBUG OFF)
 
 set(CMAKE_CXX_FLAGS "-O3 ${CMAKE_CXX_FLAGS}")

@@ -175,17 +175,12 @@ double run_gapbs_pr(uint32_t num_vertices,
             #pragma omp for schedule(dynamic, 16384)
             for (int64_t u = 0; u < static_cast<int64_t>(num_vertices); ++u) {
                 ScoreT incoming_total = 0.0f;
-                bool has_incoming = false;
                 for_in_neighbors(static_cast<uint32_t>(u), [&](uint32_t src) {
                     if (src < num_vertices) {
-                        has_incoming = true;
                         incoming_total += prev_outgoing_contrib[static_cast<size_t>(src)];
                     }
                     return true;
                 });
-                if (!has_incoming) {
-                    continue;
-                }
                 const ScoreT old_score = scores[static_cast<size_t>(u)];
                 scores[static_cast<size_t>(u)] = base_score + kDamp * incoming_total;
                 error += std::fabs(scores[static_cast<size_t>(u)] - old_score);
@@ -355,19 +350,17 @@ size_t run_gapbs_cc(uint32_t num_vertices,
 
             size_t d = 0;
             for_out_neighbors(static_cast<uint32_t>(u), [&](uint32_t v) {
-                if (d > neighbor_rounds && v < num_vertices) {
+                if (d >= neighbor_rounds && v < num_vertices) {
                     link_components(static_cast<uint32_t>(u), v, comp.data());
                 }
                 ++d;
                 return true;
             });
 
-            d = 0;
             for_in_neighbors(static_cast<uint32_t>(u), [&](uint32_t v) {
-                if (d > neighbor_rounds && v < num_vertices) {
+                if (v < num_vertices) {
                     link_components(static_cast<uint32_t>(u), v, comp.data());
                 }
-                ++d;
                 return true;
             });
         }

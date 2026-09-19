@@ -22,6 +22,15 @@ main: lib main.cpp $(HEADERS)
 	@mkdir -p bin/
 	$(CPP) $(CPPFLAGS) $(LDFLAGS) main.cpp -o bin/main $(LINKERFLAGS)
 
+VSPARSITY_DIR = $(abspath ../vertex_sparsity)
+GENERATOR_DIR = $(abspath ../../scatter_graph/generator)
+
+vsparsity: lib $(VSPARSITY_DIR)/xpgraph_vsparsity.cc
+	@mkdir -p bin/
+	$(CPP) $(CPPFLAGS) -I$(GENERATOR_DIR) -I$(VSPARSITY_DIR) $(LDFLAGS) \
+		$(VSPARSITY_DIR)/xpgraph_vsparsity.cc $(VSPARSITY_DIR)/libkrongen.a \
+		-o bin/xpgraph_vsparsity $(LINKERFLAGS)
+
 # test ingest
 testm:export LD_LIBRARY_PATH=$(NEW_LIB_PATH)
 testm: lib clean main

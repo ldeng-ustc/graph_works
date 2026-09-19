@@ -283,6 +283,7 @@ class EdgeIteratorNoDelete {
   // clear all points
   ~EdgeIteratorNoDelete() {
     it_array.clear();
+    sv_->version_memtable.reset();
   }
 
  private:

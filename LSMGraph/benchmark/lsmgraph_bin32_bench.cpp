@@ -49,6 +49,7 @@ constexpr size_t kDefaultIngestBatchEdges = kStreamChunkEdges;
 
 struct StoragePaths {
   std::string out_storage_dir;
+  std::string in_storage_dir;
 };
 
 double now_seconds() {
@@ -194,6 +195,7 @@ void log_config(const Options& opts) {
 StoragePaths make_storage_paths(const Options& opts) {
   StoragePaths paths;
   paths.out_storage_dir = (fs::path(opts.storage_dir) / "out").string();
+  paths.in_storage_dir = (fs::path(opts.storage_dir) / "in").string();
   return paths;
 }
 
@@ -245,13 +247,17 @@ void create_vertices(lsmg::LSMGraph& db,
   std::printf("[ingest] vertices done graph=%s time=%.4f\n", tag, now_seconds() - vertex_begin);
 }
 
-// Stream the bin32 file once, ingesting each chunk into out_db (forward edges
-// only) and accumulating out/in degree counters.
-size_t stream_ingest_single(lsmg::LSMGraph& out_db,
-                            lsmg_bench::LoadedGraph& graph,
-                            const Options& opts,
-                            const StoragePaths& storage_paths) {
-  std::printf("[ingest] streaming edges from %s with chunk_edges=%zu (%zu MiB)\n",
+size_t stream_ingest_graph(lsmg::LSMGraph& db,
+                           lsmg_bench::LoadedGraph& graph,
+                           const Options& opts,
+                           const std::string& storage_dir,
+                           bool reverse_edges,
+                           bool tally_degrees,
+                           const char* graph_tag) {
+  configure_lsmgraph_flags(opts, storage_dir);
+  std::printf("[ingest] streaming edges graph=%s reverse=%d from %s with chunk_edges=%zu (%zu MiB)\n",
+              graph_tag,
+              reverse_edges ? 1 : 0,
               opts.input_path.c_str(),
               kStreamChunkEdges,
               kStreamChunkBytes >> 20);
@@ -277,25 +283,28 @@ size_t stream_ingest_single(lsmg::LSMGraph& out_db,
   size_t cursor = 0;
   size_t batch_id = 0;
   const double ingest_begin = now_seconds();
-  configure_lsmgraph_flags(opts, storage_paths.out_storage_dir);
   while (true) {
     const size_t got = std::fread(chunk.data(), edge_size, kStreamChunkEdges, fp);
     if (got == 0) break;
 
     const double batch_begin = now_seconds();
 
-    // Ingest into out_db (forward edges only).
 #pragma omp parallel for num_threads(opts.num_threads) schedule(dynamic, 65536)
     for (uint64_t i = 0; i < got; ++i) {
       const auto& e = chunk[i];
-      out_db.put_edge(e.src, e.dst, std::string());
+      if (reverse_edges) {
+        db.put_edge(e.dst, e.src, std::string());
+      } else {
+        db.put_edge(e.src, e.dst, std::string());
+      }
     }
 
-    // Tally degrees serially after DB writes complete.
-    for (size_t i = 0; i < got; ++i) {
-      const auto& e = chunk[i];
-      if (e.src < graph.num_vertices) graph.out_degree[e.src]++;
-      if (e.dst < graph.num_vertices) graph.in_degree[e.dst]++;
+    if (tally_degrees) {
+      for (size_t i = 0; i < got; ++i) {
+        const auto& e = chunk[i];
+        if (e.src < graph.num_vertices) graph.out_degree[e.src]++;
+        if (e.dst < graph.num_vertices) graph.in_degree[e.dst]++;
+      }
     }
 
     cursor += got;
@@ -306,8 +315,8 @@ size_t stream_ingest_single(lsmg::LSMGraph& out_db,
     const double progress = total_edges == 0 ? 100.0
                                               : 100.0 * static_cast<double>(cursor) /
                                                     static_cast<double>(total_edges);
-    std::printf("[ingest] batch=%zu/%zu edges=%zu cursor=%zu threads=%zu progress=%.2f%% batch_time=%.4f elapsed=%.4f rate=%.4fM edges/s\n",
-                batch_id, total_batches, got, cursor, opts.num_threads,
+    std::printf("[ingest] graph=%s batch=%zu/%zu edges=%zu cursor=%zu threads=%zu progress=%.2f%% batch_time=%.4f elapsed=%.4f rate=%.4fM edges/s\n",
+                graph_tag, batch_id, total_batches, got, cursor, opts.num_threads,
                 progress, batch_seconds, elapsed, rate);
 
     if (got < kStreamChunkEdges) break;  // EOF reached
@@ -318,11 +327,9 @@ size_t stream_ingest_single(lsmg::LSMGraph& out_db,
   }
 
   const double wait_begin = now_seconds();
-  out_db.AwaitWrite();
-  while (out_db.GetCompactionState()) {
-    std::this_thread::sleep_for(std::chrono::microseconds(20));
-  }
-  std::printf("[ingest] graph=out final_background_wait=%.4f\n",
+  db.WaitForBackgroundWork();
+  std::printf("[ingest] graph=%s final_background_wait=%.4f\n",
+              graph_tag,
               now_seconds() - wait_begin);
 
   std::fclose(fp);
@@ -378,15 +385,25 @@ int main(int argc, char** argv) {
                 load_seconds);
 
     lsmg::LSMGraph* out_db = open_graph(opts, storage_paths.out_storage_dir, graph.num_vertices, "out-graph");
+    lsmg::LSMGraph* in_db = open_graph(opts, storage_paths.in_storage_dir, graph.num_vertices, "in-graph");
 
     create_vertices(*out_db, graph.num_vertices, "out");
+    create_vertices(*in_db, graph.num_vertices, "in");
 
     const double ingest_begin = now_seconds();
-    const size_t total_ingested = stream_ingest_single(*out_db, graph, opts, storage_paths);
+    const size_t total_ingested = stream_ingest_graph(
+        *out_db, graph, opts, storage_paths.out_storage_dir,
+        false, true, "out");
+    const size_t total_reverse_ingested = stream_ingest_graph(
+        *in_db, graph, opts, storage_paths.in_storage_dir,
+        true, false, "in");
+    if (total_reverse_ingested != total_ingested) {
+      throw std::runtime_error("out/in ingest edge counts differ");
+    }
     const double ingest_seconds = now_seconds() - ingest_begin;
     const long rss_ingest = get_rss_bytes();
 
-    lsmg_bench::LSMGraphNeighborOracle query_oracle(*out_db);
+    lsmg_bench::LSMGraphNeighborOracle query_oracle(*out_db, *in_db);
     auto query_walker = [&](uint32_t v) -> uint64_t {
       uint64_t degree = 0;
       query_oracle.for_out_neighbors(static_cast<size_t>(omp_get_thread_num()), v,
@@ -408,7 +425,8 @@ int main(int argc, char** argv) {
 
     lsmg_bench::BenchmarkResult result;
     if (!opts.skip_analytics) {
-      result = lsmg_bench::run_lsmgraph_graph_benchmarks_gapbs(*out_db, graph, config);
+      result = lsmg_bench::run_lsmgraph_graph_benchmarks_gapbs(
+          *out_db, *in_db, graph, config);
     }
     const double total_seconds = now_seconds() - bench_begin;
     print_summary(opts.dataset_name,
@@ -420,15 +438,8 @@ int main(int argc, char** argv) {
                   total_ingested,
                   total_seconds);
 
-    // LSMGraph's destructor occasionally segfaults while persisting metadata
-    // after large streaming runs (observed on Protein after all benchmark
-    // metrics had already been printed).  E1.1/E1.2 only needs the completed
-    // ingest+query measurements and the driver removes the storage directory
-    // after recording disk footprint, so avoid destructor teardown in the
-    // skip-analytics phase.  The OS will reclaim mappings/files on process exit.
-    if (!opts.skip_analytics) {
-      delete out_db;
-    }
+    delete in_db;
+    delete out_db;
     return 0;
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "error: %s\n", ex.what());
