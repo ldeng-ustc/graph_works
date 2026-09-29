@@ -7,3 +7,5 @@ baselines/GraphOne-P/
 *.csv
 /src/api/lib/libxpgraph.o
 /src/api/lib/libxpgraph.so
+/src/api/lib/libxpgraph_s.o
+/src/api/lib/libxpgraph_s.so

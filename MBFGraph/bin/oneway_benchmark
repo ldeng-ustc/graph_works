@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""E2 orchestration: timed append + native BF index, then native analytics."""
+import ctypes
+import json
+import os
+from pathlib import Path
+import resource
+import subprocess
+import sys
+import time
+
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE
+BIN = Path(__file__).resolve().parent
+
+def main():
+    if len(sys.argv) != 6:
+        raise ValueError('usage: oneway_benchmark INPUT VERTICES EDGES THREADS OUTPUT_DIR')
+    source, vertices, edges, threads, directory = sys.argv[1:]
+    source = str(Path(source).resolve())
+    n, edge_count, p = map(int, (vertices, edges, threads))
+    directory = Path(directory).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    if any(directory.iterdir()):
+        raise ValueError('OUTPUT_DIR must be empty; existing data is never replaced')
+    if p < 1 or p & (p-1):
+        raise ValueError('native MBFGraph requires a power of two processor count')
+    roots = int(os.environ.get('SG_BENCH_BFS_ROOTS', '1'))
+    pr_iters = int(os.environ.get('SG_BENCH_PR_ITERS', '1'))
+    cc_runs = int(os.environ.get('SG_BENCH_CC_RUNS', '1'))
+    memory = int(os.environ.get('MBF_PHYSICAL_MEMORY', str(1 << 30)))
+    page = int(os.environ.get('MBF_PAGE_SIZE', '2048'))
+    bits = int(os.environ.get('MBF_BITS_PER_BF', '256'))
+    max_v = int(os.environ.get('MBF_MAX_CHECK_V', '600000'))
+    if page % 512 or bits < 32 or bits & (bits-1) or max_v <= 1:
+        raise ValueError('invalid MBF configuration (MAX=1 is not MBFGraph)')
+    common = ['-g', 'graph', '-p', str(p), '-a', '--physical_memory', str(memory),
+              '--page_size', str(page), '--bfs_per_page', str(page//8),
+              '--bits_per_BF', str(bits), '--chip_v_once', '4',
+              '--max_check_v', str(max_v), '--kernel', 'CPU', '--measure_scatter_gather']
+    print('[mbf-config] ' + json.dumps(dict(processors=p, io_threads=1,
+          orchestration_threads=1, page_size=page, bits_per_BF=bits,
+          bfs_per_page=page//8, max_check_v=max_v, physical_memory=memory,
+          edge_io='native O_DIRECT + libaio; append/BF build buffered + fsync',
+          sort='none; original shuffled arrival order retained', vertex_state_bytes=16)), flush=True)
+    def native(algo, mode='use', extra=(), env=None, stage=None):
+        cmd = [str(BIN/'e2_driver'), *common, '-b', algo, '--bf_mode', mode, *extra]
+        print('[mbf-command] ' + json.dumps(cmd), flush=True)
+        values = {}
+        log = directory / (stage or algo)
+        with log.with_suffix('.log').open('w') as record:
+            proc = subprocess.Popen(cmd, cwd=directory, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                record.write(line)
+                print(line, end='', flush=True)
+                if line.startswith('[e2] '):
+                    k, v = line[5:].strip().split('=', 1)
+                    values[k] = v
+            if proc.wait():
+                raise RuntimeError(f'{algo} exited {proc.returncode}')
+        return values
+    start = time.monotonic()
+    if Path(source).stat().st_size != edge_count*8:
+        raise ValueError('input length does not match expected edges')
+    load = time.monotonic()-start
+    start = time.monotonic()
+    subprocess.run([str(BIN/'e2_append'), source, str(n), '0', str(edge_count)],
+                   cwd=directory, check=True)
+    appended = time.monotonic()-start
+    native('e2_index', 'create', stage='ingest-index')
+    indexed = time.monotonic()-start-appended
+    for path in directory.iterdir():
+        if path.is_file():
+            with path.open('rb') as f: os.fsync(f.fileno())
+    sync = time.monotonic()-start-appended-indexed
+    ingest = time.monotonic()-start
+    rss_ingest = max(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+                     resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)*1024
+    print(f'[mbf-timing] append={appended:.9f} index={indexed:.9f} sync={sync:.9f}', flush=True)
+    print(f'[EXPOUT]Load: {load:.9f}\n[EXPOUT]Ingest: {ingest:.9f}\n[EXPOUT]RSS_Ingest: {rss_ingest:.9f}', flush=True)
+    meta = json.loads((directory/'e2_meta.json').read_text())
+    checksum=0
+    start=time.monotonic()
+    for i in range(roots):
+        root=(meta['root']+i)%n
+        checksum+=int(native('e2_bfs', extra=['--bfs::root',str(root)],stage=f'bfs-{i}')['bfs_visited'])
+    bfs=time.monotonic()-start
+    pr_sum=1.0
+    start=time.monotonic()
+    for i in range(pr_iters):
+        env=os.environ.copy()
+        if i: env['MBF_PR_INPUT']=str(directory/f'pr-scores-{i-1}')
+        if i+1<pr_iters: env['MBF_E2_DUMP']=str(directory/f'pr-scores-{i}')
+        pr_sum=float(native('e2_pr',env=env,stage=f'pr-{i}')['pr_sum'])
+    pr=time.monotonic()-start
+    components=n
+    start=time.monotonic()
+    for i in range(cc_runs):
+        components=int(native('e2_cc',stage=f'cc-{i}')['cc_components'])
+    cc=time.monotonic()-start
+    print(f'[EXPOUT]BFS: {bfs:.9f}\n[EXPOUT]PR: {pr:.9f}\n[EXPOUT]CC: {cc:.9f}', flush=True)
+    print(f'[result] edges={meta["edges"]} bfs_checksum={checksum} pr_sum={pr_sum:.12f} cc_components={components}', flush=True)
+
+if __name__ == '__main__':
+    try: main()
+    except Exception as error:
+        print(f'[mbf-error] {error}', file=sys.stderr, flush=True)
+        sys.exit(2)

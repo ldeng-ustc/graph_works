@@ -47,3 +47,19 @@ testgdb:export LD_LIBRARY_PATH=$(NEW_LIB_PATH)
 testgdb: lib clean main
 	@echo LD_LIBRARY_PATH=$(LD_LIBRARY_PATH)
 	gdb ./bin/main
+
+.PHONY: oneway ssd-lib
+ssd-lib:
+	$(MAKE) -C src/api ssd
+oneway: ssd-lib
+	@mkdir -p bin/
+	$(CPP) $(CPPFLAGS) -std=c++17 -DXPGRAPH_S apps/xpgraph_s_oneway.cpp -o bin/xpgraph_s_oneway \
+		-L./src/api/lib -Wl,-rpath,'$$ORIGIN/../src/api/lib' -lxpgraph_s -lnuma -lpmem -lpthread
+
+ssd-probe: apps/ssd_mmap_probe.cpp
+	@mkdir -p bin/
+	$(CPP) $(CPPFLAGS) -std=c++17 $< -o bin/ssd_mmap_probe
+
+ssd-allocator-test: tests/ssd_allocator_test.cpp $(HEADERS)
+	@mkdir -p bin/
+	$(CPP) $(CPPFLAGS) -I./src -std=c++17 -DXPGRAPH_S $< -o bin/ssd_allocator_test -lpmem -lpmemobj -lnuma -lz -lpthread

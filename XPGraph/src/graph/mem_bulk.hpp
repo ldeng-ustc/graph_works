@@ -1,6 +1,7 @@
 #pragma once
 
 #include "graph/recycle_block.hpp"
+#include <limits>
 
 struct mem_bulk_t{
     vertex_t* vertex_bulk;
@@ -144,6 +145,11 @@ class thd_mem_t {
     /* -------------------------------------------------------------- */
     // dram space management
     inline buffer_t* alloc_vbuf(index_t size) {
+        if (SSD_MODE) {
+            SSD_VBUF_ALLOCS.fetch_add(1, std::memory_order_relaxed);
+            size_t previous = SSD_VBUF_MAX_ALLOC.load();
+            while (previous < size && !SSD_VBUF_MAX_ALLOC.compare_exchange_weak(previous, size)) {}
+        }
         buffer_t* vbuf;
         if(MEMPOOL){ 
             vbuf = alloc_vbuf_by_pool(size);
@@ -184,13 +190,13 @@ class thd_mem_t {
 
     inline bool alloc_vbuf_bulk(){//当该mem1区域剩余的空间不足以容纳当前节点的邻居时，分配新空间，一次性最少分配 256MB
         mem_bulk_t* mem1 = mem + omp_get_thread_num();  
-        size_t remain_size = vbuf_pool->get_remained();
-        if(remain_size < MEM_BULK_SIZE){ 
-            mem1->daddr = 0;
+        // alloc() checks and advances the shared pool under one mutex. A separate
+        // remaining-space check races with the other archive threads at exhaustion.
+        mem1->daddr = (char*)vbuf_pool->alloc(MEM_BULK_SIZE);
+        if (!mem1->daddr) {
             mem1->dsize = 0;
             return false;
         }
-        mem1->daddr = (char*)vbuf_pool->alloc(MEM_BULK_SIZE);
         mem1->dsize = MEM_BULK_SIZE;
         // vbuf_pool->print_usage();
         return true;
@@ -219,14 +225,15 @@ class thd_mem_t {
     // pmem space management
     inline void alloc_pmem_bulk(size_t size, uint8_t socket_id){//当该mem1区域剩余的空间不足以容纳当前节点的邻居时，分配新空间，一次性最少分配 256MB
         mem_bulk_t* mem1 = mem + omp_get_thread_num();
-        assert(size <= MEM_BULK_SIZE);
-        mem1->paddr = (char*)pblk_pools[socket_id]->alloc(MEM_BULK_SIZE);
+        const size_t bulk_size = SSD_MODE ? std::max<size_t>(size, MEM_BULK_SIZE) : MEM_BULK_SIZE;
+        assert(size <= bulk_size);
+        mem1->paddr = (char*)pblk_pools[socket_id]->alloc(bulk_size);
         if(mem1->paddr == 0){
             logstream(LOG_WARNING) << "Fail to alloc a new pmem mem_bulk of " << MEM_BULK_SIZE << ", mem1->size = " << mem1->psize << ", need size = " << size << ", tid = " << omp_get_thread_num() << std::endl;
             logstream(LOG_WARNING) << "No space left in pblk pool." << std::endl;
-            exit(0);
+            throw std::runtime_error("XPGraph persistent block pool exhausted");
         }
-        mem1->psize = MEM_BULK_SIZE;
+        mem1->psize = bulk_size;
     }
 
     // sequential allocation
@@ -239,6 +246,8 @@ class thd_mem_t {
         mem1->psize -= size; //更新剩余的空间量
 
         assert(pblk);
+        if ((size - sizeof(pblock_t))/sizeof(vid_t) > std::numeric_limits<blk_deg_t>::max())
+            throw std::runtime_error("persistent block degree exceeds counter capacity");
         degree_t max_count = (size - sizeof(pblock_t))/sizeof(vid_t); //该节点当前新分配的vbuf可以容纳的邻居的个数
         pblk->add_next((pblock_t*)NULL);
         pblk->set_nebrcount(0); // 当前节点的当前邻接表的已经存储的邻居计数，初始化为0
@@ -272,6 +281,8 @@ class thd_mem_t {
             }
         }
         assert(pblk);
+        if ((size - sizeof(pblock_t))/sizeof(vid_t) > std::numeric_limits<blk_deg_t>::max())
+            throw std::runtime_error("persistent block degree exceeds counter capacity");
         degree_t max_count = (size - sizeof(pblock_t))/sizeof(vid_t); //该节点当前新分配的vbuf可以容纳的邻居的个数
         pblk->add_next((pblock_t*)NULL);
         pblk->set_nebrcount(0); // 当前节点的当前邻接表的已经存储的邻居计数，初始化为0

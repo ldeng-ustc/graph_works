@@ -13,7 +13,11 @@ typedef uint64_t vid_t; //vertex id
 typedef uint32_t blk_deg_t; //vertex degree in a block
 #else
 typedef uint32_t vid_t; //vertex id
-typedef uint16_t blk_deg_t; //vertex degree in a block
+#ifdef XPGRAPH_S
+typedef uint32_t blk_deg_t; // SSD merged lists can exceed 65535 neighbors
+#else
+typedef uint16_t blk_deg_t; // original PMEM layout
+#endif
 #endif
 typedef uint64_t index_t;
 typedef int64_t offset_t;
@@ -98,6 +102,10 @@ public:
 
     // Graph Arrange
     index_t buffer_all_edges();
+    void wait_quiescent(); // drain partial edge-log batch, flush DRAM, then SSD sync
+    void sync_storage();
+    void print_ssd_stats();
+    bool verify_ssd_storage(); // test-only pread comparison with native mapped blocks
     index_t flush_all_vbufs();
     index_t archive_all_vbufs(); // buffer, then flush
     bool compact_out_adjs(vid_t vid);

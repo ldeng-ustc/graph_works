@@ -18,6 +18,7 @@ public:
 	inline void set_nebrcount(blk_deg_t degree) {count = degree;}
     inline size_t get_size() { return max_count * sizeof(vid_t) + sizeof(buffer_t); };
     inline bool is_full() { 
+        if (SSD_MODE) return count == max_count;
         if (max_count >= 63) return count >= (max_count - 3);
         return count == max_count;
     }

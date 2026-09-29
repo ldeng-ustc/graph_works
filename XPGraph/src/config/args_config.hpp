@@ -47,6 +47,10 @@ void print_usage() {
 
 void args_config(int argc, const char ** argv) {
     set_argc(argc, argv);
+    SSD_MODE = get_option_int("--ssd", 0);
+    ONE_WAY = get_option_int("--oneway", 0);
+    SSD_GRANULARITY = get_option_long("--ssd_granularity", 4096);
+    SSD_MERGE_THRESHOLD = get_option_int("--merge_threshold", 8);
     /* ---------------------------------------------------------------------- */
     // print_usage
     HELP = get_option_int("-h", 0); // help for print_usage
@@ -78,10 +82,10 @@ void args_config(int argc, const char ** argv) {
     ELOG_SHIFT = get_option_int("--elogsize", 30); // Bits of maximum number of edges in edge log. Default: 30 for 1 billion edges, i.e., edge size equals 8GB. (27 for 1GB)
     ELOG_CAP = 1L << ELOG_SHIFT;//capacity of edge log
     ELOG_MASK =  ELOG_CAP - 1;
-    BATCH_SHIFT = 16;//bits of edge batching in edge log
+    BATCH_SHIFT = get_option_int("--batch_shift", 16);//bits of edge batching in edge log
     BATCH_CAP = 1L << BATCH_SHIFT;// edge batching in edge log
     BATCH_MASK = BATCH_CAP - 1; // 0xFFFF;
-    BUFFER_CAP = ELOG_CAP - (BATCH_CAP * 64);// edge buffering size in edge log
+    BUFFER_CAP = SSD_MODE ? ELOG_CAP * 3 / 4 : ELOG_CAP - (BATCH_CAP * 64);// edge buffering size in edge log
 
     /* ---------------------------------------------------------------------- */
     // Leveled vertex buffer config
@@ -99,8 +103,8 @@ void args_config(int argc, const char ** argv) {
 
     /* ---------------------------------------------------------------------- */
     // Metadata management
-    VERTEX_BULK_SIZE = 1 << 20;
-    SNAP_BULK_SIZE = 1 << 20;
+    VERTEX_BULK_SIZE = SSD_MODE ? 4096 : 1 << 20;
+    SNAP_BULK_SIZE = SSD_MODE ? 4096 : 1 << 20;
     VERT_INPM = get_option_int("--vert_inpm", 0); // vert_inpm = 1 for store vertex info in pmem
     SNAP_INPM = get_option_int("--snap_inpm", 0); // snap_inpm = 1 for store snap info in pmem
     TEDGE_INPM = get_option_int("--tedge_inpm", 0); // lbuf_inpm = 1 for store local buf in pmem
@@ -113,6 +117,12 @@ void args_config(int argc, const char ** argv) {
     TEDGE_POOL_SIZE = get_option_long("--tedge_pool", 8) * GB; // Total tedge pool size threshold, GB
     VBUF_POOL_SIZE = get_option_long("--vbuf_pool", 16) * GB; // Total vertex buffer pool size threshold in GigaByte. Default: 16.
     PBLK_POOL_SIZE = get_option_long("--pblk_pools", 64) * GB; // Total persistent PMEM block pool size threshold in GigaByte. Default: 64. 
+    if (SSD_MODE) {
+        VBUF_POOL_SIZE = get_option_long("--vbuf_pool_mb", 1024) * size_t(MB);
+        PBLK_POOL_SIZE = get_option_long("--pblk_pool_mb", 65536) * size_t(MB);
+        NUM_SOCKETS = 1; NUMA_OPT = 0;
+        VERT_INPM = SNAP_INPM = TEDGE_INPM = LEBUF_INPM = false;
+    }
     /* ---------------------------------------------------------------------- */
     // PMEM mempool size
 
@@ -126,6 +136,18 @@ void args_config(int argc, const char ** argv) {
     // Variant systems
     BATTERY = get_option_int("--battery", 0); // 1 for XPGraph-B by allowing overwritting buffered edges. Default: 0.
     DRAMONLY = get_option_int("--dram_only", 0); // 1 for XPGraph-D by storing all data structure in DRAM and set the per-vertex buffer size as fixed 64B. Default: 0.
+    if (SSD_MODE) {
+        if (DRAMONLY || !MEMPOOL || !THD_COUNT || THD_COUNT > 128 ||
+            ELOG_SHIFT > 35 || BATCH_SHIFT >= ELOG_SHIFT ||
+            MIN_VBUF_SIZE < sizeof(buffer_t) + sizeof(vid_t) ||
+            (MIN_VBUF_SIZE & (MIN_VBUF_SIZE - 1)) ||
+            (MAX_VBUF_SIZE & (MAX_VBUF_SIZE - 1)) ||
+            MAX_VBUF_SIZE < MIN_VBUF_SIZE || MAX_VBUF_SIZE > MEM_BULK_SIZE ||
+            VBUF_POOL_SIZE < MEM_BULK_SIZE * THD_COUNT ||
+            SSD_GRANULARITY < 512 || (SSD_GRANULARITY & (SSD_GRANULARITY - 1)))
+            throw std::invalid_argument("invalid SSD configuration");
+        CLWB = false;
+    }
     if(DRAMONLY == 1){
         LEVELED_BUF = 0;
         MIN_VBUF_SIZE = MAX_VBUF_SIZE = 64;
@@ -153,6 +175,9 @@ void prinf_config(){
     /* ---------------------------------------------------------------------- */
     // Basic arguments for graph info
     cout<< "Print config information:" << endl;
+    cout << "[xpgraph-s-config] ssd=" << SSD_MODE << " oneway=" << ONE_WAY
+         << " granularity=" << SSD_GRANULARITY << " merge_threshold=" << SSD_MERGE_THRESHOLD
+         << " vbuf_bytes=" << VBUF_POOL_SIZE << " pblk_bytes=" << PBLK_POOL_SIZE << endl;
     cout<< "  Graph info: " << endl;
     cout<< "\t - filepath = " << filepath << endl;
     cout<< "\t - nverts = " << nverts << endl;

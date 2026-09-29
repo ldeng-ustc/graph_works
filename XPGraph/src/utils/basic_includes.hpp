@@ -38,7 +38,11 @@ typedef uint64_t vid_t; //vertex id
 typedef uint32_t blk_deg_t; //vertex degree in a block
 #else
 typedef uint32_t vid_t; //vertex id
-typedef uint16_t blk_deg_t; //vertex degree in a block
+#ifdef XPGRAPH_S
+typedef uint32_t blk_deg_t; // SSD merged lists can exceed 65535 neighbors
+#else
+typedef uint16_t blk_deg_t; // original PMEM layout
+#endif
 #endif
 typedef uint64_t index_t;
 typedef int64_t offset_t;
@@ -116,7 +120,7 @@ int64_t FIRST_BLOCK_MARK = 0;
 static VARIABLE_IS_NOT_USED void metrics_report(metrics &m);
 static VARIABLE_IS_NOT_USED void metrics_report(metrics &m) {
     // std::string reporters = get_option_string("metrics.reporter", "console, file, html");
-    std::string reporters = "console,file";
+    std::string reporters = SSD_MODE ? "console" : "console,file";
     char * creps = (char*)reporters.c_str();
     const char * delims = ",";
     char * t = strtok(creps, delims);
@@ -153,6 +157,7 @@ inline void bind_thread_to_cpu(int cpu_id){
 }
 
 inline void cancel_thread_bind(){
+    if (SSD_MODE || NUMA_OPT == 0) return;
     uint8_t cpu_num = std::thread::hardware_concurrency();
     // std::cout << "In cancel_thread_bind(), cpu_num = " << (uint32_t)cpu_num << std::endl; // 96
     cpu_set_t cpu_mask;
@@ -164,6 +169,7 @@ inline void cancel_thread_bind(){
 }
 
 inline void bind_thread_to_socket(tid_t tid, int socket_id){
+    if (SSD_MODE || NUMA_OPT == 0) return;
     assert(NUM_SOCKETS == 2);
     // if(socket_id == 0){
     //     if(tid >= 0 && tid < 24) bind_thread_to_cpu(tid);

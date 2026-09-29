@@ -2,6 +2,7 @@
 
 #include "graph/edgeshard.hpp"
 #include "config/args_config.hpp"
+#include <chrono>
 
 class levelgraph_t
 {
@@ -9,7 +10,12 @@ private:
     // edge log storing new coming edge lists
     edgelog_t* elog;
     edge_shard_t* edge_shard;
-    bool is_finished;
+    std::atomic<bool> is_finished{false};
+    bool stopping = false, pending = false, worker_busy = false;
+    std::atomic<unsigned> active_queries{0};
+    std::atomic<uint64_t> merge_low{0}, merge_high{0}, merged_vertices{0}, merge_nanoseconds{0};
+    std::atomic<unsigned> query_peak{0};
+    std::mutex query_locks[4096];
 
     // metadata: vertex and snap info
     vid_t nverts;
@@ -73,19 +79,50 @@ public:
         }
     }
     static void* snap_func(void* arg){
-        levelgraph_t* ptr = (levelgraph_t*)(arg);
-        do {
-            pthread_mutex_lock(&ptr->snap_mutex);
-            pthread_cond_wait(&ptr->snap_condition, &ptr->snap_mutex);
-            // struct timespec ts;
-            // clock_gettime(CLOCK_REALTIME, &ts);
-            // ts.tv_nsec += 100 * 1000000;  //30 is my milliseconds
-            // pthread_cond_timedwait(&ptr->snap_condition, &ptr->snap_mutex, &ts);
+        levelgraph_t* ptr = static_cast<levelgraph_t*>(arg);
+        pthread_mutex_lock(&ptr->snap_mutex);
+        while (!ptr->stopping) {
+            while (!ptr->pending && !ptr->stopping)
+                pthread_cond_wait(&ptr->snap_condition, &ptr->snap_mutex);
+            if (ptr->stopping) break;
+            ptr->pending = false;
+            ptr->worker_busy = true;
             pthread_mutex_unlock(&ptr->snap_mutex);
-            // ptr->create_snapshot();
-            while (ptr->create_snapshot());
-        } while(1);
-        return 0;
+            while (ptr->create_snapshot()) {}
+            pthread_mutex_lock(&ptr->snap_mutex);
+            ptr->worker_busy = false;
+            pthread_cond_broadcast(&ptr->snap_condition);
+        }
+        pthread_mutex_unlock(&ptr->snap_mutex);
+        return nullptr;
+    }
+
+    void sync_storage() {
+        if (!SSD_MODE) return;
+        ssd_sync(elog->data, std::min<index_t>(elog->head.load(), ELOG_CAP) * sizeof(edge_t));
+        for (unsigned socket = 0; socket < NUM_SOCKETS; ++socket)
+            ssd_sync(pblk_pools[socket]->get_base(), pblk_pools[socket]->get_used());
+    }
+    bool verify_ssd_storage() {
+        if (!SSD_MODE) return false;
+        sync_storage();
+        for (vid_t v = 0; v < nverts; ++v) {
+            auto* vertex = out_graph->get_vertex(v);
+            if (!vertex) continue;
+            for (auto* block = vertex->get_1st_block(); block; block = block->get_next())
+                if (!ssd_verify_bytes(block, sizeof(pblock_t) + size_t(block->get_nebrcount()) * sizeof(vid_t))) return false;
+        }
+        return ssd_verify_bytes(elog->data, std::min<index_t>(elog->head.load(), ELOG_CAP) * sizeof(edge_t));
+    }
+    void print_ssd_stats() {
+        for (unsigned i = 0; i < NUM_SOCKETS; ++i)
+            std::printf("[xpgraph-s-storage] pool=%u allocated_bytes=%zu reserved_bytes=%zu log_edges=%lu\n",
+                        i, pblk_pools[i]->get_used(), pblk_pools[i]->get_size(), elog->head.load());
+        std::printf("[xpgraph-s-buffer] allocations=%lu upgrades=%lu max_bytes=%zu\n",
+                    SSD_VBUF_ALLOCS.load(), SSD_VBUF_UPGRADES.load(), SSD_VBUF_MAX_ALLOC.load());
+        std::printf("[xpgraph-s-merge] concurrency=active-neighborhood-reads peak=%u threshold=%u low=%lu high=%lu merged=%lu seconds=%.9f\n",
+                    query_peak.load(), SSD_MERGE_THRESHOLD, merge_low.load(), merge_high.load(),
+                    merged_vertices.load(), merge_nanoseconds.load() * 1e-9);
     }
 
     /* -------------------------------------------------------------- */
@@ -157,14 +194,21 @@ inline void levelgraph_t::init_graph(){
 
     edge_shard = new edge_shard_t(elog, m);
     out_graph = new graph_t(false, nverts, vbuf_pool, pblk_pools, vert_pool, snap_pool, m);
-    in_graph = new graph_t(true, nverts, vbuf_pool, pblk_pools, vert_pool, snap_pool, m);
+    in_graph = ONE_WAY ? nullptr : new graph_t(true, nverts, vbuf_pool, pblk_pools, vert_pool, snap_pool, m);
     create_threads(); // create thread to monitor for archive
     is_finished = false;
     snap_id = 0;
     m.stop_time("1.2  -init_alloc_graph");
 }
 inline void levelgraph_t::free_graph(){
-    pthread_cancel(snap_thread);
+    inform_wait_buffer_all();
+    pthread_mutex_lock(&snap_mutex);
+    stopping = true;
+    pthread_cond_broadcast(&snap_condition);
+    pthread_mutex_unlock(&snap_mutex);
+    pthread_join(snap_thread, nullptr);
+    pthread_cond_destroy(&snap_condition);
+    pthread_mutex_destroy(&snap_mutex);
     delete out_graph;
     delete in_graph;
     delete edge_shard;
@@ -195,7 +239,7 @@ inline void levelgraph_t::alloc_elog_data(){
 inline void levelgraph_t::free_elog_data(){
     if(DRAMONLY == 0){
         size_t size = ELOG_CAP * sizeof(edge_t);
-        pmem_unmap(elog->data, size);
+        storage_unmap(elog->data, size);
     } else {
         free(elog->data);
     }
@@ -277,7 +321,7 @@ inline void levelgraph_t::free_pblk_pools(){
     if(NUM_SOCKETS > 1){
         pblk_pools[1]->clear();
         if(DRAMONLY == 0){
-            pmem_unmap(pblk_pools[1]->get_base(), size);
+            storage_unmap(pblk_pools[1]->get_base(), size);
         } else {
             free(pblk_pools[1]->get_base());
         }
@@ -285,7 +329,7 @@ inline void levelgraph_t::free_pblk_pools(){
     }
     pblk_pools[0]->clear();
     if(DRAMONLY == 0){
-        pmem_unmap(pblk_pools[0]->get_base(), size);
+        storage_unmap(pblk_pools[0]->get_base(), size);
     } else {
         free(pblk_pools[0]->get_base());
     }
@@ -297,7 +341,7 @@ inline void levelgraph_t::free_pblk_pools(mempool_t** &_pblk_pools) {
     if(NUM_SOCKETS > 1){
         _pblk_pools[1]->clear();
         if(DRAMONLY == 0){
-            pmem_unmap(_pblk_pools[1]->get_base(), size);
+            storage_unmap(_pblk_pools[1]->get_base(), size);
         } else {
             free(_pblk_pools[1]->get_base());
         }
@@ -305,7 +349,7 @@ inline void levelgraph_t::free_pblk_pools(mempool_t** &_pblk_pools) {
     }
     _pblk_pools[0]->clear();
     if(DRAMONLY == 0){
-        pmem_unmap(_pblk_pools[0]->get_base(), size);
+        storage_unmap(_pblk_pools[0]->get_base(), size);
     } else {
         free(_pblk_pools[0]->get_base());
     }
@@ -338,7 +382,7 @@ inline void levelgraph_t::alloc_vert_pool(){
 }
 inline void levelgraph_t::free_vert_pool(){
     vert_pool->clear();
-    pmem_unmap(vert_pool->get_base(), VERT_POOL_SIZE);
+    storage_unmap(vert_pool->get_base(), VERT_POOL_SIZE);
     delete vert_pool;
 }
 
@@ -353,31 +397,33 @@ inline void levelgraph_t:: alloc_snap_pool(){
 }
 inline void levelgraph_t::free_snap_pool(){
     snap_pool->clear();
-    pmem_unmap(snap_pool->get_base(), SNAP_POOL_SIZE);
+    storage_unmap(snap_pool->get_base(), SNAP_POOL_SIZE);
     delete snap_pool;
 }
 
 /* -------------------------------------------------------------- */
 // write edge log
 void levelgraph_t::batch_edge_no_archive(edge_t edge){
-    index_t index = __sync_fetch_and_add(&elog->head, 1L);
+    index_t index = elog->head.fetch_add(1, std::memory_order_acq_rel);
     index_t index1 = (index & ELOG_MASK);
     elog->data[index1] = edge;
 }
 
 inline void levelgraph_t::batch_edge(edge_t edge){
-    index_t index = __sync_fetch_and_add(&elog->head, 1L);
+    // E2 and the original add_edges API have one input producer. Publish only after storing.
+    index_t index = SSD_MODE ? elog->head.load(std::memory_order_relaxed) : elog->head.fetch_add(1, std::memory_order_acq_rel);
     //Check if we are overwritting the unarchived data, if so sleep
     // while (index + 1 - elog->tail > elog->capacity) {
     while (index + 2 - elog->efree > elog->capacity) {
-        m.start_time("2.2.2    -sleep_to_wait_archive");
-        // logstream(LOG_DEBUG) << "Sleeping for edge log, index + 1 = " << index + 1 << ", elog->efree = " << elog->efree << std::endl; sleep(1);
+        if (!SSD_MODE) m.start_time("2.2.2    -sleep_to_wait_archive");
+        // logstream(LOG_DEBUG) << "Sleeping for edge log, index + 1 = " << index + 1 << ", elog->efree = " << elog->efree.load() << std::endl; sleep(1);
         usleep(10);
-        m.stop_time("2.2.2    -sleep_to_wait_archive");
+        if (!SSD_MODE) m.stop_time("2.2.2    -sleep_to_wait_archive");
     }
     // write edge log to elog_head
     index_t index1 = (index & ELOG_MASK);
-    elog->data[index1] = edge; // 这里也许可以加入预取优化？
+    elog->data[index1] = edge;
+    if (SSD_MODE) elog->head.store(index + 1, std::memory_order_release);
 
     //inform archive thread if the number of edges reaching the threshold
     index += 1;
@@ -396,7 +442,7 @@ bool levelgraph_t::create_snapshot(index_t marker1){
     if(marker1 == 0) marker1 = elog->head;
     elog->marker = marker1;
     count = elog->marker - elog->tail;
-    logstream(LOG_INFO) << "creating snapshot " << snap_id << " of range [" << elog->tail << ", " << elog->marker << "), archiving number of edges = " << count << ",  tid = " << omp_get_thread_num()  << std::endl;
+    logstream(LOG_INFO) << "creating snapshot " << snap_id << " of range [" << elog->tail.load() << ", " << elog->marker.load() << "), archiving number of edges = " << count << ",  tid = " << omp_get_thread_num()  << std::endl;
     m.start_time("3-classify_and_buffer");
     // #pragma omp parallel num_threads (THD_COUNT) 
     // {
@@ -415,6 +461,8 @@ bool levelgraph_t::create_snapshot(index_t marker1){
     }
     m.stop_time("3.1-3 -classify");
     m.start_time("3.4 -buffer");
+    out_graph->set_snap_id(snap_id);
+    if (in_graph) in_graph->set_snap_id(snap_id);
     #pragma omp parallel num_threads (THD_COUNT) 
     {
         edge_shard->classify_and_buffer_d(snap_id, out_graph, in_graph);
@@ -425,7 +473,7 @@ bool levelgraph_t::create_snapshot(index_t marker1){
 
     // if overwrite comes soon, then flush all buffer to PMEM
     if(marker1 - elog->efree >= BUFFER_CAP){
-        logstream(LOG_DEBUG) << "overwriting soon: " << marker1 << " " << elog->efree << " " << BUFFER_CAP << endl;
+        logstream(LOG_DEBUG) << "overwriting soon: " << marker1 << " " << elog->efree.load() << " " << BUFFER_CAP << endl;
         if(BATTERY == 0 && DRAMONLY == 0){
             flush_all_bufs(marker1);
         } else {
@@ -435,7 +483,7 @@ bool levelgraph_t::create_snapshot(index_t marker1){
 
     // if vbuf_pool fills up soon, then flush all buffer to PMEM
     if(MEMPOOL){
-        if(vbuf_pool->get_remained() < 1024 * MB){
+        if(vbuf_pool->get_remained() < (SSD_MODE ? std::min(VBUF_POOL_SIZE / 4, MEM_BULK_SIZE * THD_COUNT) : 1024 * MB)){
             logstream(LOG_DEBUG) << "vbuf_pool fills up soon..., remained: " << vbuf_pool->get_remained()/MB << "MB." << endl;
             flush_all_bufs(marker1);
         }
@@ -448,7 +496,7 @@ bool levelgraph_t::create_snapshot(index_t marker1){
 
 void levelgraph_t::flush_all_bufs(index_t marker1){
     m.start_time("4-flush_all_bufs");
-    logstream(LOG_WARNING) << "flush_all_vbufs start, elog->efree = " << elog->efree << ", marker1 = " <<marker1 << std::endl;
+    logstream(LOG_WARNING) << "flush_all_vbufs start, elog->efree = " << elog->efree.load() << ", marker1 = " <<marker1 << std::endl;
     if (MEMPOOL) {
         if(vbuf_pool->get_used() > vbuf_pool_max_used) vbuf_pool_max_used = vbuf_pool->get_used();
         vbuf_pool->print_usage();
@@ -459,31 +507,35 @@ void levelgraph_t::flush_all_bufs(index_t marker1){
         edge_shard->archive_all_d(out_graph, in_graph);
     }
     if(MEMPOOL) vbuf_pool->clear();
-    elog->efree = marker1;
-    logstream(LOG_WARNING) << "flush_all_vbufs end, elog->efree = " << elog->efree << ", marker1 = " <<marker1 << std::endl;
+    if (SSD_MODE) sync_storage();
+    elog->efree.store(marker1, std::memory_order_release);
+    logstream(LOG_WARNING) << "flush_all_vbufs end, elog->efree = " << elog->efree.load() << ", marker1 = " <<marker1 << std::endl;
     m.stop_time("4-flush_all_bufs");
 }
 
 inline void levelgraph_t::inform_buffer(){
     pthread_mutex_lock(&snap_mutex);
     // pthread_cond_signal函数的作用是发送一个信号给另外一个正在处于阻塞等待状态的线程, 使其脱离阻塞状态,继续执行.如果没有线程处在阻塞等待状态,pthread_cond_signal也会成功返回。
-    pthread_cond_signal(&snap_condition);
+    pending = true;
+    pthread_cond_broadcast(&snap_condition);
     pthread_mutex_unlock(&snap_mutex);
 }
 
 // Wait for finishing buffering all edges (write edges in elog to vbufs). 
 // Be careful on why you calling.
 inline void levelgraph_t::inform_wait_buffer_all() {
-    is_finished = true;
-    while (elog->head != elog->tail) {
-        inform_buffer();
-        // logstream(LOG_DEBUG) << "Sleeping for buf end, head = " << elog->head << ", tail = " << elog->tail << std::endl; sleep(1);
-        usleep(1);
-    }
-    // flush_all_bufs(0);
+    pthread_mutex_lock(&snap_mutex);
+    is_finished.store(true);
+    pending = true;
+    pthread_cond_broadcast(&snap_condition);
+    while (elog->head.load() != elog->tail.load() || worker_busy || pending)
+        pthread_cond_wait(&snap_condition, &snap_mutex);
+    is_finished.store(false);
+    pthread_mutex_unlock(&snap_mutex);
 }
 
 inline degree_t levelgraph_t::get_degree(vid_t vid, bool is_in_graph) {
+    if (ONE_WAY && is_in_graph) return 0;
     if(vid >= nverts){
         logstream(LOG_ERROR) << "Invalid vid, as vid: " << vid << " >= nverts:" << nverts << std::endl;
         return 0;
@@ -516,11 +568,34 @@ inline degree_t levelgraph_t::get_degree(vid_t vid, bool is_in_graph) {
 }
 
 inline degree_t levelgraph_t::query_nebrs(vid_t* neighbors, vid_t vid, bool is_in_graph) {
+    if (ONE_WAY && is_in_graph) return 0;
     if(vid >= nverts){
         logstream(LOG_ERROR) << "Invalid vid, as vid: " << vid << " >= nverts:" << nverts << std::endl;
         return 0;
     }
 
+    struct query_guard {
+        std::atomic<unsigned>* counter;
+        ~query_guard() { if (counter) counter->fetch_sub(1, std::memory_order_relaxed); }
+    } guard{SSD_MODE ? &active_queries : nullptr};
+    std::unique_lock<std::mutex> query_lock(query_locks[vid % 4096], std::defer_lock);
+    if (SSD_MODE) {
+        query_lock.lock();
+        const unsigned active = active_queries.fetch_add(1, std::memory_order_relaxed) + 1;
+        unsigned peak = query_peak.load();
+        while (peak < active && !query_peak.compare_exchange_weak(peak, active)) {}
+        auto* graph = is_in_graph ? in_graph : out_graph;
+        if (active < SSD_MERGE_THRESHOLD) {
+            merge_low.fetch_add(1, std::memory_order_relaxed);
+            if (graph->fragmented(vid)) {
+                const auto begin = std::chrono::steady_clock::now();
+                graph->compact_vbuf_pblks(vid);
+                merged_vertices.fetch_add(1, std::memory_order_relaxed);
+                merge_nanoseconds.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin).count(), std::memory_order_relaxed);
+            }
+        } else merge_high.fetch_add(1, std::memory_order_relaxed);
+    }
     // query from graph (from pblks + vbufs)
     degree_t degree, local_degree = 0;
     if (!is_in_graph) {
@@ -611,6 +686,7 @@ inline degree_t levelgraph_t::query_nebrs_logged_st(vid_t* neighbors, vid_t vid,
 }
 
 inline degree_t levelgraph_t::query_nebrs_buffered(vid_t* neighbors, vid_t vid, bool is_in_graph) {
+    if (ONE_WAY && is_in_graph) return 0;
     if(vid >= nverts){
         logstream(LOG_ERROR) << "Invalid vid, as vid: " << vid << " >= nverts:" << nverts << std::endl;
         return 0;
@@ -626,6 +702,7 @@ inline degree_t levelgraph_t::query_nebrs_buffered(vid_t* neighbors, vid_t vid, 
 }
 
 inline degree_t levelgraph_t::query_nebrs_flushed(vid_t* neighbors, vid_t vid, bool is_in_graph) {
+    if (ONE_WAY && is_in_graph) return 0;
     if(vid >= nverts){
         logstream(LOG_ERROR) << "Invalid vid, as vid: " << vid << " >= nverts:" << nverts << std::endl;
         return 0;
@@ -641,6 +718,7 @@ inline degree_t levelgraph_t::query_nebrs_flushed(vid_t* neighbors, vid_t vid, b
 }
 
 bool levelgraph_t::compact_adjlists(vid_t vid, bool is_in_graph){
+    if (ONE_WAY && is_in_graph) return 0;
     if(vid >= nverts){
         logstream(LOG_ERROR) << "Invalid vid, as vid: " << vid << " >= nverts:" << nverts << std::endl;
         return 0;
@@ -665,7 +743,7 @@ bool levelgraph_t::compact_adjlists(vid_t vid, bool is_in_graph){
 
 bool levelgraph_t::compact_all_adjlists(){
     out_graph->compact_all_vbuf_pblks();
-    in_graph->compact_all_vbuf_pblks();
+    if (in_graph) in_graph->compact_all_vbuf_pblks();
     return true;
 }
 
@@ -674,7 +752,7 @@ void levelgraph_t::compress_all_graph() {
     #pragma omp parallel num_threads (THD_COUNT) 
     {
         out_graph->compress();
-        in_graph->compress();
+        if (in_graph) in_graph->compress();
     }
 }
 
@@ -686,12 +764,12 @@ void levelgraph_t::compact_all_graph() {
     printf("old_pblk_pools[0] = %p, old_pblk_pools[1] = %p\n", this->pblk_pools[0]->get_base(), this->pblk_pools[1]->get_base());
     printf("new_pblk_pools[0] = %p, new_pblk_pools[1] = %p\n", new_pblk_pools[0]->get_base(), new_pblk_pools[1]->get_base());
     out_graph->set_pblk_pools(new_pblk_pools);
-    in_graph->set_pblk_pools(new_pblk_pools);
+    if (in_graph) in_graph->set_pblk_pools(new_pblk_pools);
 
     #pragma omp parallel num_threads (THD_COUNT) 
     {
         out_graph->compact();
-        in_graph->compact();
+        if (in_graph) in_graph->compact();
     }
     free_pblk_pools(this->pblk_pools);
     this->pblk_pools = new_pblk_pools;

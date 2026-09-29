@@ -62,7 +62,8 @@ public:
         thd_mem->set_pblk_pools(new_pblk_pools);
     }
     
-    void buffer_range_edges(edge_t* edges, index_t count, uint16_t snap_id1);
+    void set_snap_id(sid_t value) { snap_id = value; }
+    void buffer_range_edges(edge_t* edges, index_t count, sid_t snap_id1);
     void increment_degree(vid_t vid);
     void decrement_degree(vid_t vid);
     void buffer_nebr(vid_t vid, vid_t nebr);
@@ -85,6 +86,11 @@ public:
     degree_t get_nebrs(vid_t vid, vid_t* ptr, sdegree_t count);
     degree_t get_nebrs_from_vbuf(vid_t vid, vid_t* neighbors);
     degree_t get_nebrs_from_pblks(vid_t vid, vid_t* neighbors);
+    bool fragmented(vid_t vid) {
+        auto* v = vertices[vid]; if (!v) return false;
+        auto* b = v->get_1st_block();
+        return b && (b->get_next() || (v->get_vbuf() && v->get_vbuf()->get_nebrcount()));
+    }
     degree_t compact_vbuf_pblks(vid_t vid);
     bool compact_all_vbuf_pblks();
     void compact();
@@ -94,8 +100,9 @@ public:
 
 /* -------------------------------------------------------------- */
 // update graph
-void graph_t::buffer_range_edges(edge_t* edges, index_t count, uint16_t snap_id1){ 
-    snap_id = snap_id1;
+void graph_t::buffer_range_edges(edge_t* edges, index_t count, sid_t snap_id1){
+    // The coordinator publishes the snapshot id before entering the parallel region.
+    (void)snap_id1;
     vid_t src, dst;
     // count temporary degree of each vertices in current range_edges
     for(index_t i = 0; i < count; ++i){
@@ -184,10 +191,10 @@ void graph_t::buffer_nebr(vid_t vid, vid_t nebr){
             if(new_vbuf == 0) {
                 logstream(LOG_DEBUG) << "Increment vbuf fail for vertex: " << vid << ", " << vert->get_degree() << endl;
                 archive_and_free_vbuf(vid);
-                pblock_t* cur_blk = vert->get_last_block();
-                cur_blk->assert_valid();
-                cur_blk->add_nebr(nebr);
-                if(CLWB) clwb_pblk(cur_blk);
+                // The flush may exactly fill the last block. Reuse the native
+                // single-edge archiver so it allocates the next block if needed.
+                archive_nebr(vid, nebr);
+                if(CLWB) clwb_pblk(vert->get_last_block());
                 return;
             }
             vbuf = new_vbuf;
@@ -313,6 +320,12 @@ void graph_t::compress_nebrs(vid_t vid) {
 }
 
 index_t graph_t::comp_vbuf_size(degree_t max_count){
+    if (SSD_MODE) {
+        size_t size = MIN_VBUF_SIZE;
+        const size_t need = size_t(max_count) * sizeof(vid_t) + sizeof(buffer_t);
+        while (size < need && size < MAX_VBUF_SIZE) size *= 2;
+        return size;
+    }
     if(!LEVELED_BUF) return MAX_VBUF_SIZE;  // set fixed buffer size
     // compute the propriate buffer size by vertex degree
     index_t size = 0;
@@ -330,6 +343,11 @@ index_t graph_t::comp_vbuf_size(degree_t max_count){
 }
 
 index_t graph_t::comp_pblk_size(degree_t max_count){
+    if (SSD_MODE) {
+        const size_t need = size_t(max_count) * sizeof(vid_t) + sizeof(pblock_t);
+        if (need >= SSD_GRANULARITY) return (need + SSD_GRANULARITY - 1) / SSD_GRANULARITY * SSD_GRANULARITY;
+        size_t size = 32; while (size < need) size *= 2; return size;
+    }
     index_t size = 0;
     // if(max_count > 256 || deg > 8192) size = ALIGNMENT(max_count*sizeof(vid_t)+sizeof(pblock_t), 4096);
     if(max_count > 256) size = ALIGNMENT(max_count*sizeof(vid_t)+sizeof(pblock_t), 4096);
@@ -356,6 +374,7 @@ buffer_t* graph_t::update_vbuf(vertex_t* vert){
     if(vbuf == 0){ // allocate dram space for vertex buffer
         if(!(vbuf = thd_mem->alloc_vbuf(size))) return 0; 
     } else {
+        if (SSD_MODE) SSD_VBUF_UPGRADES.fetch_add(1, std::memory_order_relaxed);
         // vbuf->assert_valid();
         buffer_t* new_vbuf = thd_mem->alloc_vbuf(size);
         if(!new_vbuf) return 0; 
@@ -407,7 +426,7 @@ void graph_t::archive_vbuf(vid_t vid){
     blk_deg_t pblk_count = cur_blk->get_nebrcount();
     blk_deg_t pblk_maxcount = cur_blk->get_max_nebrcount();
     blk_deg_t rest_count = pblk_maxcount - pblk_count;
-    if(vbuf_nebrcount + 1 <= rest_count){
+    if(vbuf_nebrcount <= rest_count){
         if(pblk_count + vbuf_nebrcount > pblk_maxcount) logstream(LOG_FATAL) << pblk_count << " " << vbuf_nebrcount << " " << pblk_maxcount << endl;
         cur_blk->add_nebrs(vbuf->get_adjlist(), vbuf_nebrcount);
     } else {
@@ -631,7 +650,8 @@ degree_t graph_t::compact_vbuf_pblks(vid_t vid){
         vert->set_vbuf(0);
     }
 
-    vert->update_first_block(final_blk);
+    if (SSD_MODE) vert->set_1st_block(final_blk);
+    else vert->update_first_block(final_blk);
     vert->set_last_block(final_blk); // after free previous pblks (TODO)
     return count;
 }

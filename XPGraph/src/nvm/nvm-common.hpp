@@ -4,6 +4,60 @@
 #include <libpmem.h>
 #include <iostream>
 #include <cstring>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdexcept>
+#include <vector>
+#include <string>
+#include <mutex>
+
+extern bool SSD_MODE;
+struct ssd_mapping_t { void* addr; size_t size; int fd; };
+inline std::vector<ssd_mapping_t> ssd_mappings;
+inline void ssd_sync(void* address, size_t bytes) {
+    if (!SSD_MODE || !bytes) return;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t aligned = begin & ~(page - 1);
+    if (msync(reinterpret_cast<void*>(aligned), bytes + begin - aligned, MS_SYNC))
+        throw std::runtime_error("SSD msync: " + std::string(strerror(errno)));
+    for (const auto& mapping : ssd_mappings) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(mapping.addr);
+        if (begin >= base && begin < base + mapping.size) {
+            if (fdatasync(mapping.fd)) throw std::runtime_error("SSD fdatasync failed");
+            return;
+        }
+    }
+    throw std::runtime_error("SSD sync address outside registered mappings");
+}
+inline bool ssd_verify_bytes(const void* address, size_t bytes) {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+    for (const auto& mapping : ssd_mappings) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(mapping.addr);
+        if (begin >= base && begin + bytes <= base + mapping.size) {
+            std::vector<char> disk(bytes);
+            size_t done = 0;
+            while (done < bytes) {
+                const ssize_t n = pread(mapping.fd, disk.data() + done, bytes - done, begin - base + done);
+                if (n <= 0) throw std::runtime_error("SSD verification pread failed");
+                done += n;
+            }
+            return std::memcmp(address, disk.data(), bytes) == 0;
+        }
+    }
+    throw std::runtime_error("SSD verification address outside mapping");
+}
+inline void storage_unmap(void* addr, size_t size) {
+    if (!SSD_MODE) { pmem_unmap(addr, size); return; }
+    for (auto it = ssd_mappings.begin(); it != ssd_mappings.end(); ++it) {
+        if (it->addr == addr) {
+            munmap(addr, size); close(it->fd); ssd_mappings.erase(it); return;
+        }
+    }
+    throw std::runtime_error("SSD unmap address outside registered mappings");
+}
 
 /* ---------------------------------------------------------------------- */
 // used for memory usage
@@ -24,6 +78,15 @@ size_t elog_size = 0;
 /* -------------------------------------------------------------- */
 // ALLOC -- use pmem_map_file
 static inline void* pmem_alloc(const char* filepath, size_t size){
+    if (SSD_MODE) {
+        const int fd = open(filepath, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) throw std::runtime_error("SSD create " + std::string(filepath) + ": " + strerror(errno));
+        if (ftruncate(fd, static_cast<off_t>(size))) { close(fd); throw std::runtime_error("SSD ftruncate failed"); }
+        void* addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (addr == MAP_FAILED) { close(fd); throw std::runtime_error("SSD mmap failed"); }
+        ssd_mappings.push_back({addr, size, fd});
+        return addr;
+    }
     size_t mapped_len;
     int is_pmem;
     void* addr = pmem_map_file(filepath, size, PMEM_FILE_CREATE, 0666, &mapped_len, &is_pmem);
@@ -45,7 +108,8 @@ static inline void* pmem_alloc(const char* filepath, size_t size){
 
 /* -------------------------------------------------------------- */
 // FLUSH -- use clwb and sfence
-static inline void clwb(void * addr){ 
+static inline void clwb(void * addr){
+  if (SSD_MODE) return; // SSD durability is provided by msync + fdatasync at phase boundaries.
   asm volatile("clwb %0": :"m"(*((char *)addr))); 
 } 
 

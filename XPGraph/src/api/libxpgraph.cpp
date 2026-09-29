@@ -34,7 +34,7 @@ XPGraph::~XPGraph(){
     levelgraph->free_elog();
     delete levelgraph;
     
-    if (!PERSIST) {
+    if (!PERSIST && !SSD_MODE) {
         rm_dir(NVMPATH0.c_str());
         rm_dir(NVMPATH1.c_str());
     }
@@ -281,6 +281,16 @@ degree_t XPGraph::get_in_nebrs_flushed(vid_t vid, vid_t* local_adjlist) {
 
 /* -------------------------------------------------------------- */
 // Graph Arrange
+void XPGraph::wait_quiescent() {
+    levelgraph->inform_wait_buffer_all();
+    const index_t tail = levelgraph->get_elog()->tail.load();
+    if (tail != levelgraph->get_elog()->efree.load()) levelgraph->flush_all_bufs(tail);
+    levelgraph->sync_storage();
+}
+void XPGraph::sync_storage() { levelgraph->sync_storage(); }
+void XPGraph::print_ssd_stats() { levelgraph->print_ssd_stats(); }
+bool XPGraph::verify_ssd_storage() { return levelgraph->verify_ssd_storage(); }
+
 index_t XPGraph::buffer_all_edges(){
     index_t head = levelgraph->get_elog()->head;
     index_t tail = levelgraph->get_elog()->tail;
@@ -297,11 +307,10 @@ index_t XPGraph::flush_all_vbufs(){
 
 index_t XPGraph::archive_all_vbufs(){
     index_t head = levelgraph->get_elog()->head;
-    index_t tail = levelgraph->get_elog()->tail;
     index_t efree = levelgraph->get_elog()->efree;
     if(head != efree) {
         levelgraph->inform_wait_buffer_all();
-        levelgraph->flush_all_bufs(tail);
+        levelgraph->flush_all_bufs(levelgraph->get_elog()->tail.load());
     }
     return head - efree;
 }

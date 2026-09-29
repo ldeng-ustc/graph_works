@@ -1,6 +1,7 @@
 #pragma once
 
 #include "utils/basic_includes.hpp"
+#include <atomic>
 
 class  edge_t {
  public:
@@ -13,10 +14,10 @@ class edgelog_t
 public:
     edge_t* data; // circular buffer for edge logs
     index_t capacity;
-    index_t head; // position of write log
-    index_t marker; // unbuffered range = [elog_marker, elog_head)
-    index_t tail; // buffering range = [elog_tail, elog_marker)
-    index_t efree; // buffered range = [elog_efree, elog_tail), archived = [xx, elog_efree) -> can be overwritten
+    std::atomic<index_t> head; // position of write log
+    std::atomic<index_t> marker; // unbuffered range = [elog_marker, elog_head)
+    std::atomic<index_t> tail; // buffering range = [elog_tail, elog_marker)
+    std::atomic<index_t> efree; // buffered range = [elog_efree, elog_tail), archived = [xx, elog_efree) -> can be overwritten
 
     edgelog_t():data(0), capacity(0){
         // capacity = ELOG_CAP;

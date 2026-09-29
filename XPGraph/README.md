@@ -1,5 +1,8 @@
 # XPGraph
 
+For our E2 SSD reproduction, see [README-SSD.md](README-SSD.md).
+The original PMEM instructions below are preserved for reference.
+
 This respository is for following paper:
 
 **MICRO'22 paper:** XPGraph: XPline-Friendly Persistent Memory Graph Stores for Large-Scale Evolving Graphs

@@ -51,7 +51,7 @@ class edge_shard_t {
     edge_shard_t(edgelog_t* _elog, metrics &_m):elog(_elog), m(_m){
         edge_buf_count = BATCH_CAP;
         edge_buf_out = (edge_t*)calloc(edge_buf_count, sizeof(edge_t));
-        edge_buf_in = (edge_t*)calloc(edge_buf_count, sizeof(edge_t));
+        edge_buf_in = ONE_WAY ? nullptr : (edge_t*)calloc(edge_buf_count, sizeof(edge_t));
 
         if(NUMA_OPT == 2){
             num_subgraphs = NUM_SOCKETS;
@@ -411,7 +411,7 @@ void edge_shard_t::classify_store_and_divide(vid_t v_count, tid_t thd_count){
         memset(thd_ecount_in[tid][sid], 0, RANGE_COUNT * sizeof(index_t));
     }
     index_t** ecount_out = thd_ecount_out[tid];
-    index_t** ecount_in = thd_ecount_in[tid];
+    index_t** ecount_in = ONE_WAY ? nullptr : thd_ecount_in[tid];
 
     count_range_edges(bit_shift, ecount_out, ecount_in);
 
@@ -420,7 +420,7 @@ void edge_shard_t::classify_store_and_divide(vid_t v_count, tid_t thd_count){
     // m.stop_time("3.1.1  -count_range_edges_barrier_t" + t_str);
 
     prefix_sum(global_range_out, thd_ecount_out, thd_count, 0);
-    prefix_sum(global_range_in, thd_ecount_in, thd_count, 1);
+    if (!ONE_WAY) prefix_sum(global_range_in, thd_ecount_in, thd_count, 1);
 
     // m.stop_time("3.1  -count_range_edges_t" + t_str);
 
@@ -434,7 +434,7 @@ void edge_shard_t::classify_store_and_divide(vid_t v_count, tid_t thd_count){
         if(edge_buf_count < total_edge_count){
             edge_buf_count = total_edge_count;
             edge_buf_out = (edge_t*)realloc(edge_buf_out, edge_buf_count * sizeof(edge_t));
-            edge_buf_in = (edge_t*)realloc(edge_buf_in, edge_buf_count * sizeof(edge_t));
+            if (!ONE_WAY) edge_buf_in = (edge_t*)realloc(edge_buf_in, edge_buf_count * sizeof(edge_t));
         }
     }
     #pragma omp barrier
@@ -448,7 +448,7 @@ void edge_shard_t::classify_store_and_divide(vid_t v_count, tid_t thd_count){
     #pragma omp single nowait
     {
         // m.start_time("3.2.0  -point_to_temp_edges_t" + t_str);
-        point_to_temp_edges(global_range_in, 1);
+        if (!ONE_WAY) point_to_temp_edges(global_range_in, 1);
         // m.stop_time("3.2.0  -point_to_temp_edges_t" + t_str);
     }
 
@@ -477,7 +477,7 @@ void edge_shard_t::classify_store_and_divide(vid_t v_count, tid_t thd_count){
         #pragma omp single nowait
         {
             // m.start_time("3.3.1  -work_division_t" + t_str);
-            work_division_GO(global_range_in, range_end_in, sid, edge_count);
+            if (!ONE_WAY) work_division_GO(global_range_in, range_end_in, sid, edge_count);
             // m.stop_time("3.3.1  -work_division_t" + t_str);
         }
     }
@@ -534,6 +534,7 @@ void edge_shard_t::classify_and_buffer_d(index_t snap_id, graph_t* out_graph, gr
                 // m.stop_time("3.4.1  -buffer_ranges_out_t" + t_str);
             }
 
+            if (ONE_WAY) continue;
             // buffering in-graph
             if (tid == THD_COUNT - 1) { 
                 r_start = 0; 
@@ -569,6 +570,7 @@ void edge_shard_t::classify_and_buffer_d(index_t snap_id, graph_t* out_graph, gr
             out_edgesum_per_thread[tid] += total_count;
         }
 
+        if (ONE_WAY) return;
         rid_t r_start_in, r_end_in;
         if (tid == THD_COUNT - 1) { 
             r_start_in = 0; 
@@ -615,6 +617,7 @@ void edge_shard_t::archive_all_d(graph_t* out_graph, graph_t* in_graph){
         out_graph->archive_range_vbufs(v_start_out + id, v_end_out, num_subgraphs);
     }
 
+    if (ONE_WAY) return;
     vid_t v_start_in, v_end_in;
     if (tid == THD_COUNT - 1) { 
         v_start_in = 0; 

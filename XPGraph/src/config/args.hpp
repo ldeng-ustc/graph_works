@@ -1,4 +1,12 @@
 #pragma once
+#include <atomic>
+
+inline std::atomic<uint64_t> SSD_VBUF_ALLOCS{0}, SSD_VBUF_UPGRADES{0};
+inline std::atomic<size_t> SSD_VBUF_MAX_ALLOC{0};
+inline bool SSD_MODE = false;
+inline bool ONE_WAY = false;
+inline size_t SSD_GRANULARITY = 4096;
+inline uint32_t SSD_MERGE_THRESHOLD = 8;
 
 /* ---------------------------------------------------------------------- */
 // Basic arguments for graph info
